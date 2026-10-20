@@ -1,0 +1,6 @@
+ouroboros
+bootstrap
+*.cmi
+*.cmx
+*.o
+*.ll

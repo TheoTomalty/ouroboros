@@ -1,0 +1,3272 @@
+; ======== ;
+; Language ;
+; ======== ;
+
+(let defmacro (macro [name args (… body)]
+	`(let ʹname (macro ʹargs ʺbody))))
+(defmacro defn [name args (… body)]
+	`(let ʹname (fn ʹargs ʺbody)))
+(defmacro typedef [name]
+	`(let ʹname (type ʹname)))
+(defmacro when [cond (… body)]
+	`(if ʹcond { ʺbody } ())
+)
+(defmacro cond args
+	(defn inner [[cond (… body)] (… rest)]
+		(let else (if (= 0 (len rest)) '() (apply inner rest)))
+		`(if ʹcond { ʺbody } ʹelse)
+	)
+	(apply inner args)
+)
+
+(defn newline [] (puts “\n”))
+(defn fst [[x .]] x)
+(defn snd [[. y]] y)
+(defn compose [g f] (fn x (g (apply f x))))
+(defn concat-map [f l]
+	(if (= (len l) 0) [] (apply concat (map f l)))
+)
+(defn concat-mapi [f l]
+	(if (= (len l) 0) [] (apply concat (mapi f l)))
+)
+
+(typedef Context) ; { Context, Map[Sym, *] }
+
+(defn get-context [(# Context c m) sym]
+	(cond
+		((has m sym) (. m sym))
+		((≠ c ()) (get-context c sym))
+		(⊤ (error “Not in Scope '” sym “'”))
+	)
+)
+(defn get-context? [(# Context c m) sym]
+	(cond
+		((has m sym) (. m sym))
+		((≠ c ()) (get-context? c sym))
+	)
+)
+
+(defn add-context [(# Context c m) sym v]
+	(Context c (insert m sym v))
+)
+
+; ===== ;
+; Types ;
+; ===== ;
+
+(typedef Void) ; { }
+(typedef RawInt) ; { Int }
+(typedef RawPtr) ; { RawType }
+(typedef RawFn) ; { RawType, List[RawType] }
+(typedef RawArray) ; { RawType, Int }
+(typedef RawTuple) ; { List[RawType] }
+(typedef RawOpaque) ; { }
+(typedef Opaque) ; { Sym }
+(typedef Struct) ; { Sym, Map[Sym, (RawType, Int)] } (may be cyclic)
+(typedef Union) ; { Sym, RawType, Map[Sym, (RawType, Int)] }
+
+(let rawtypes (Map))
+(defmacro rawtype [name value]
+	(,
+		`(let ʹname ʹvalue)
+		`(set rawtypes (insert rawtypes (quote ʹname) ʹname))
+	)
+)
+
+(rawtype void (Void))
+(rawtype i1 (RawInt 1))
+(rawtype i8 (RawInt 8))
+(rawtype i16 (RawInt 16))
+(rawtype i32 (RawInt 32))
+(rawtype i64 (RawInt 64))
+(rawtype bool i1)
+(rawtype char i8)
+
+(let builtin-types (Context ◎ rawtypes))
+
+(defn raw-type [t]
+	(match t
+		((# Opaque name) (RawOpaque))
+		((# Union name t .) t)
+		((# Struct name m)
+			(let pairs (values m))
+			(let types (alloc List (len pairs)))
+			(each (fn [[v i]] (← types i v)) pairs)
+			(RawTuple types))
+	)
+)
+
+(defn int-align [i]
+	(cond
+		((≤ i 8) 1)
+		((≤ i 16) 2)
+		((≤ i 32) 4)
+		((≤ i 64) 8)
+		(⊤ (error “integer too wide”))
+	)
+)
+
+(defn extend-align [i align]
+	(let rem (% i align))
+	(if (= 0 rem)
+		i
+		(+ i (- align rem))
+	)
+)
+
+(defn alignof [t]
+	(match t
+		((# RawInt i) (int-align i))
+		((# RawPtr .) 8)
+		((# RawArray t .) (alignof t))
+		((# Union (… .)) (alignof (raw-type t)))
+		((# Struct (… .)) (alignof (raw-type t)))
+		((# RawTuple ts)
+			(apply max (map alignof ts)))
+	)
+)
+
+(defn sizeof [t]
+	(match t
+		((# Void) 0)
+		((# RawInt i) (int-align i))
+		((# RawPtr .) 8)
+		((# RawArray t n) (× (sizeof t) n))
+		((# Union (… .)) (sizeof (raw-type t)))
+		((# Struct (… .)) (sizeof (raw-type t)))
+		((# RawTuple ts)
+			(let size 0)
+			(each (fn [r]
+				(set size (extend-align size (alignof r)))
+				(set size (+ size (sizeof r)))
+			) ts)
+			(extend-align size (alignof t))
+		)
+	)
+)
+
+; ==== ;
+; LLVM ;
+; ==== ;
+
+(typedef LocalOp) ; { RawType, Int }
+(typedef GlobalOp) ; { RawType, Int }
+(typedef BoolOp) ; { Bool }
+(typedef IntOp) ; { Int }
+(typedef StrOp) ; { Str }
+(typedef StructOp) ; { RawType, List[Op] }
+(typedef ListOp) ; { RawType, List[Op] }
+(typedef UndefOp) ; { RawType }
+(typedef VoidOp) ; { }
+(typedef BitCastOp) ; { Op, RawType }
+(typedef TruncOp) ; { Op, RawType }
+(typedef ZExtOp) ; { Op, RawType }
+
+(typedef Add) ; { Op, Op }
+(typedef Sub) ; { Op, Op }
+(typedef Mul) ; { Op, Op }
+(typedef Div) ; { Op, Op }
+(typedef Mod) ; { Op, Op }
+(typedef Shl) ; { Op, Op }
+(typedef Shr) ; { Op, Op }
+(typedef Eq) ; { Op, Op }
+(typedef Neq) ; { Op, Op }
+(typedef Gt) ; { Op, Op }
+(typedef Gte) ; { Op, Op }
+(typedef Lt) ; { Op, Op }
+(typedef Lte) ; { Op, Op }
+(typedef Assign) ; { Int, Inst }
+(typedef Alloca) ; { RawType }
+(typedef BitCast) ; { Op, RawType }
+(typedef IntToPtr) ; { Op, RawType }
+(typedef PtrToInt) ; { Op, RawType }
+(typedef Store) ; { Op, Op } (second is pointer version of first type)
+(typedef Load) ; { Op } (needs to be a pointer type)
+(typedef Bz) ; { Op, Label, Label }
+(typedef Br) ; { Label }
+(typedef Ret) ; { Op }
+(typedef Label) ; { Str }
+(typedef Phi) ; { RawType, List[(Op, Label)] }
+(typedef Call) ; { Op, List[Op] } (first is function type)
+(typedef ExValue) ; { Op, List[Int] }
+(typedef InValue) ; { Op, Op, List[Int] }
+(typedef ExPtr) ; { Op, List[Op] } (first must be pointer)
+(typedef Trunc) ; { Op, RawType }
+(typedef ZExt) ; { Op, RawType }
+(typedef Switch) ; { Op, Op, List[(Op, Op)] }
+
+(typedef Static) ; { Int, Op }
+(typedef Func) ; { Sym, RawType, List[Inst] } (second is a function type)
+(typedef Extern) ; { Sym, RawType } (second is a function type)
+(typedef Module) ; { List[Decl] }
+
+(defn op-type [o] (match o
+	((# LocalOp t .) t)
+	((# GlobalOp t .) t)
+	((# BoolOp .) i1)
+	((# IntOp .) i32)
+	((# Label .) Label)
+	((# StrOp s) (RawArray i8 (+ (len s) 1)))
+	((# StructOp t .) t)
+	((# ListOp t .) t)
+	((# UndefOp t) t)
+	((# VoidOp) void)
+	((# BitCastOp . t) t)
+	((# TruncOp . t) t)
+	((# ZExtOp . t) t)
+))
+
+(defn op-is-const [o] (match o
+	((# LocalOp . .) ⊥)
+	((# GlobalOp . .) ⊤)
+	((# BoolOp .) ⊤)
+	((# IntOp .) ⊤)
+	((# Label .) ⊥)
+	((# StrOp .) ⊤)
+	((# StructOp . .) ⊤)
+	((# ListOp t .) ⊤)
+	((# UndefOp .) ⊤)
+	((# VoidOp) ⊤)
+	((# BitCastOp . .) ⊤)
+	((# TruncOp . .) ⊤)
+	((# ZExtOp . .) ⊤)
+))
+
+(defn llvm-show-type [t]
+	(match t
+		((# Void) “void”)
+		((# RawInt i) (concat “i” (show i)))
+		((# RawPtr t) (concat (llvm-show-type t) “*”))
+		((# RawFn r as) (concat (llvm-show-type r) “ (” (join “, ” (map llvm-show-type as)) “)”))
+		((# RawArray t i) (concat “[” (show i) “ x ” (llvm-show-type t) “]”))
+		((# RawTuple l) (concat “{” (join “, ” (map llvm-show-type l)) “}”))
+		((# RawOpaque) “opaque”)
+		((# Opaque name) (concat “%” (str name)))
+		((# Struct name (… .)) (concat “%” (str name)))
+		((# Union name (… .)) (concat “%” (str name)))
+		((! Label) “label”)
+	)
+)
+
+(defn llvm-show-op-type [o]
+	(llvm-show-type (op-type o)))
+
+(defn llvm-show-op-value [o]
+	(match o
+		((# LocalOp t n)
+			(concat “%” (str n)))
+		((# GlobalOp t n)
+			(concat “@” (str n)))
+		((# StructOp t ops)
+			(concat “{” (join “, ” (map llvm-show-op ops)) “}”))
+		((# ListOp t ops)
+			(concat “[” (join “, ” (map llvm-show-op ops)) “]”))
+		((# UndefOp .)
+			(concat “undef”))
+		((# VoidOp)
+			(concat “”))
+		((# IntOp i)
+			(show i))
+		((# BoolOp b)
+			(if b “1” “0”))
+		((# StrOp s)
+			(concat “[” (join “, ” (map (fn [i] (concat “i8 ” (str i))) (concat (bytes s) [0]))) “]”))
+		((# Label s)
+			(concat “%” s))
+		((# BitCastOp op t)
+			(concat “bitcast(” (llvm-show-op op) “ to ” (llvm-show-type t) “)”))
+		((# TruncOp op t)
+			(concat “trunc(” (llvm-show-op op) “ to ” (llvm-show-type t) “)”))
+		((# ZExtOp op t)
+			(if (= (typeof op) IntOp)
+				{ (let (# IntOp i) op) (show i) }
+				(concat “zext(” (llvm-show-op op) “ to ” (llvm-show-type t) “)”)
+			))
+	)
+)
+
+(defn llvm-show-op [o]
+	(concat (llvm-show-op-type o) “ ” (llvm-show-op-value o))
+)
+
+(defn llvm-show-inst [i]
+	(defn show-binop [s x y]
+		(concat s “ ” (llvm-show-op x) “, ” (llvm-show-op-value y))
+	)
+	(defn show-bincmp [s x y]
+		(concat “icmp ” s “ ” (llvm-show-op x) “, ” (llvm-show-op-value y))
+	)
+	(match i
+		((# Add x y) (show-binop “add” x y))
+		((# Sub x y) (show-binop “sub” x y))
+		((# Mul x y) (show-binop “mul” x y))
+		((# Div x y) (show-binop “sdiv” x y))
+		((# Mod x y) (show-binop “srem” x y))
+		((# Shl x y) (show-binop “shl” x y))
+		((# Shr x y) (show-binop “lshr” x y))
+		((# Eq x y) (show-bincmp “eq” x y))
+		((# Neq x y) (show-bincmp “ne” x y))
+		((# Gt x y) (show-bincmp “sgt” x y))
+		((# Gte x y) (show-bincmp “sge” x y))
+		((# Lt x y) (show-bincmp “slt” x y))
+		((# Lte x y) (show-bincmp “sle” x y))
+		((# Alloca t)
+			(concat
+				“alloca ”
+				(llvm-show-type t))
+		)
+		((# Alloca t x)
+			(concat
+				“alloca ”
+				(llvm-show-type t) “, ” (llvm-show-op x))
+		)
+		((# BitCast op t)
+			(concat “bitcast ” (llvm-show-op op) “ to ” (llvm-show-type t))
+		)
+		((# IntToPtr op t)
+			(concat “inttoptr ” (llvm-show-op op) “ to ” (llvm-show-type t))
+		)
+		((# PtrToInt op t)
+			(concat “ptrtoint ” (llvm-show-op op) “ to ” (llvm-show-type t))
+		)
+		((# Assign n i)
+			(concat “%” (show n) “ = ” (llvm-show-inst i))
+		)
+		((# Store o1 o2)
+			(concat “store ” (llvm-show-op o1) “, ” (llvm-show-op o2))
+		)
+		((# Load o)
+			(let (# RawPtr t) (op-type o))
+			(concat “load ” (llvm-show-type t) “, ” (llvm-show-op o))
+		)
+		((# Br l) (concat “br ” (llvm-show-op l)))
+		((# Bz x l1 l2) (concat “br ” (llvm-show-op x) “, ” (llvm-show-op l1) “, ” (llvm-show-op l2)))
+		((# Phi t pairs) (concat “phi ” (llvm-show-type t) “ ” (join “, ” (map (fn [[op l]] (concat “[ ” (llvm-show-op-value op) “, ” (llvm-show-op-value l) “ ]”)) pairs))))
+		((# Call f args)
+			(let (# RawPtr (# RawFn t .)) (op-type f))
+			(concat “call ” (llvm-show-type t) “ ” (llvm-show-op-value f) “(” (join “, ” (map llvm-show-op args)) “)”)
+		)
+		((# ExValue op l)
+			(concat “extractvalue ” (llvm-show-op op) “, ” (join “, ” (map show l)))
+		)
+		((# InValue op1 op2 i)
+			(concat “insertvalue ” (llvm-show-op op1) “, ” (llvm-show-op op2) “, ” (show i))
+		)
+		((# ExPtr op l)
+			(let (# RawPtr t) (op-type op))
+			(concat “getelementptr ” (llvm-show-type t) “, ” (llvm-show-op op) “, ” (join “, ” (map llvm-show-op l)))
+		)
+		((# Trunc op t)
+			(concat “trunc ” (llvm-show-op op) “ to ” (llvm-show-type t))
+		)
+		((# ZExt op t)
+			(concat “zext ” (llvm-show-op op) “ to ” (llvm-show-type t))
+		)
+		((# Switch op d t)
+			(concat “switch ” (llvm-show-op op) “, ” (llvm-show-op d) “ [ ” (join “ ” (map (fn [[i l]] (concat (llvm-show-op i) “, ” (llvm-show-op l))) t)) “ ]”)
+		)
+		((# Ret o)
+			(concat “ret ” (llvm-show-op o))
+		)
+	)
+)
+
+(defn llvm-show-inst-indent [i]
+	(if (= (typeof i) Label)
+		(concat (. i 0) “:\n”)
+		(concat “\t” (llvm-show-inst i) “\n”)
+	)
+)
+
+(defn llvm-show-decl [decl]
+	(match decl
+		((# Static name op)
+			(concat “@” (str name) “ = global ” (llvm-show-op op))
+		)
+		((# Func name (# RawFn r args_t) insts)
+			(let args (join “, ” (map llvm-show-type args_t)))
+			(let head (concat “define ” (llvm-show-type r) “ @” (str name) “(” args “)”))
+			(let body (concat-map llvm-show-inst-indent insts))
+			(concat head “ {\n” body “}”)
+		)
+		((# Extern name (# RawFn r args_t))
+			(let args (join “, ” (map llvm-show-type args_t)))
+			(concat “declare ” (llvm-show-type r) “ @” (str name) “(” args “)”)
+		)
+		((@ t (# Opaque (… .)))
+			(concat (llvm-show-type t) “ = type ” (llvm-show-type (raw-type t)))
+		)
+		((@ t (# Struct (… .)))
+			(concat (llvm-show-type t) “ = type ” (llvm-show-type (raw-type t)))
+		)
+		((@ t (# Union (… .)))
+			(concat (llvm-show-type t) “ = type ” (llvm-show-type (raw-type t)))
+		)
+	)
+)
+
+(defn llvm-show-module [(# Module decls)]
+	(join “\n\n” (map llvm-show-decl decls))
+)
+
+; ======== ;
+; Compiler ;
+; ======== ;
+
+(typedef Nil)
+(typedef Cons)
+(defn :: [v l] (Cons v l))
+(defn llist-len [l]
+	(let i 0)
+	(while (≠ (typeof l) Nil)
+		(let (# Cons . lʹ) l)
+		(set l lʹ)
+		(set i (+ i 1))
+	)
+	i
+)
+(defn llist-flatten [l]
+	(let n (llist-len l))
+	(let ret (alloc List n))
+	(let i (- n 1))
+	(while (≠ (typeof l) Nil)
+		(let (# Cons v lʹ) l)
+		(← ret i v)
+		(set l lʹ)
+		(set i (- i 1))
+	)
+	ret
+)
+
+(typedef FuncBuilder) ; { () → Int, () → Str }
+(typedef ModuleBuilder) ; { () → Int }
+
+(defn module-builder []
+	(let names (Map))
+	(defn gen-name [p]
+		(let i (if (has names p)
+			(+ (. names p) 1)
+			0
+		))
+		(set names (insert names p i))
+		(if (= 0 i) p (concat p (str i)))
+	)
+	(let l (Nil))
+	(ModuleBuilder
+		(fn args (match args ([] (gen-name “.”)) ([p] (gen-name p))))
+		(fn [x] (set l (:: x l)))
+		(fn [] (llist-flatten l))
+	)
+)
+
+(defn func-builder [mb]
+	(let i (- 0 1))
+	(let l 0)
+	(FuncBuilder
+		mb
+		(fn [] (set i (+ i 1)) i)
+		(fn [] (set l (+ l 1)) (Label (concat “block” (show l))))
+	)
+)
+
+(defn builder-mb [(# FuncBuilder mb . .)] mb)
+(defn builder-gi [(# FuncBuilder . gi .)] (gi))
+(defn builder-gl [(# FuncBuilder . . gl)] (gl))
+(defn builder-gg [b (… args)] (match b
+	((# FuncBuilder mb . .) (apply builder-gg (concat [mb] args)))
+	((# ModuleBuilder gg . .) (apply gg args))
+))
+(defn builder-pg [b x] (match b
+	((# FuncBuilder mb . .) (builder-pg mb x))
+	((# ModuleBuilder . pg .) (pg x))
+))
+(defn builder-ug [(# ModuleBuilder . . ug)] (ug))
+
+(typedef ValSem) ; { Op }
+(typedef RefSem) ; { Op }
+(typedef MacroSem) ; { List[*] → * }
+
+(defn sem-type [x] (match x
+	((# ValSem op) (op-type op))
+	((# RefSem op)
+		(let (# RawPtr t) (op-type op))
+		t
+	)
+))
+
+(defn force-ref [b x] (match x
+	((# RefSem op) [op []])
+	((# ValSem op)
+		(let t (op-type op))
+		(let i (builder-gi b))
+		(let opʹ (LocalOp (RawPtr t) i))
+		[opʹ [(Assign i (Alloca t)) (Store op opʹ)]]
+	)
+))
+
+(defn force-val [b x] (match x
+	((# ValSem op) [op []])
+	((# RefSem op)
+		(let i (builder-gi b))
+		(let (# RawPtr t) (op-type op))
+		[(LocalOp t i) [(Assign i (Load op))]]
+	)
+))
+
+(defn compile-expr-coerce [b c_t c t2 x]
+	(let [x_v x_i] (compile-expr b c_t c x))
+	(let t1 (op-type x_v))
+	(if (∧ (= (typeof t1) RawInt) (= (typeof t2) RawInt)) {
+		(let [(# RawInt n) (# RawInt m)] [t1 t2])
+		(cond
+			((= n m) [x_v x_i])
+			((> n m)
+				(if (op-is-const x_v) [(TruncOp x_v t2) x_i] {
+					(let i (builder-gi b))
+					[(LocalOp t2 i) (concat x_i [(Assign i (Trunc x_v t2))])]
+				})
+			)
+			((< n m)
+				(if (op-is-const x_v) [(ZExtOp x_v t2) x_i] {
+					(let i (builder-gi b))
+					[(LocalOp t2 i) (concat x_i [(Assign i (ZExt x_v t2))])]
+				})
+			)
+		)
+	} [x_v x_i])
+)
+
+(defmacro binop [sym constr]
+	`['ʹsym (fn [b c_t c [x y]]
+		(let [x_v x_i] (compile-expr b c_t c x))
+		(let t (op-type x_v))
+		(let [y_v y_i] (compile-expr-coerce b c_t c t y))
+		(let i (builder-gi b))
+		[(ValSem (LocalOp t i)) (concat x_i y_i [(Assign i (ʹconstr x_v y_v))])]
+	)]
+)
+
+(defmacro bincmp [sym constr]
+	`['ʹsym (fn [b c_t c [x y]]
+		(let [x_v x_i] (compile-expr b c_t c x))
+		(let [y_v y_i] (compile-expr b c_t c y))
+		(let i (builder-gi b))
+		[(ValSem (LocalOp i1 i)) (concat x_i y_i [(Assign i (ʹconstr x_v y_v))])]
+	)]
+)
+
+(defn last-label [label insts]
+	(let i 0)
+	(let length (len insts))
+	(while (< i length)
+		(let inst (. insts i))
+		(when (= (typeof inst) Label)
+			(set label inst)
+		)
+		(set i (+ i 1))
+	)
+	label
+)
+
+(let ops (Map
+	(binop + Add)
+	(binop - Sub)
+	(binop × Mul)
+	(binop / Div)
+	(binop % Mod)
+	(binop << Shl)
+	(binop >> Shr)
+	(bincmp = Eq)
+	(bincmp ≠ Neq)
+	(bincmp > Gt)
+	(bincmp ≥ Gte)
+	(bincmp < Lt)
+	(bincmp ≤ Lte)
+	['# (fn [b c_t c [t (… args)]]
+		(let tʹ (compile-type c_t t))
+		(let (# RawTuple tʺ) (raw-type tʹ))
+		(let op (UndefOp tʹ))
+		(let ops_i (concat-mapi (fn [x i]
+			(let [x_v x_i] (compile-expr-coerce b c_t c (. tʺ i) x))
+			(let j (builder-gi b))
+			(let next (InValue op x_v i))
+			(set op (LocalOp tʹ j))
+			(concat x_i [(Assign j next)])
+		) args))
+		[(ValSem op) ops_i]
+	)]
+	[', (fn [b c_t c args]
+		(let pairs (map (fn [arg] (compile-expr b c_t c arg)) args))
+		(let t (RawTuple (map (fn [[op .]] (op-type op)) pairs)))
+		(let op (UndefOp t))
+		(let ops_i (mapi (fn [[x_v .] i]
+			(let j (builder-gi b))
+			(let next (InValue op x_v i))
+			(set op (LocalOp t j))
+			(Assign j next)
+		) pairs))
+		[(ValSem op) (concat (concat-map snd pairs) ops_i)]
+	)]
+	['. (fn [b c_t c [x (… ids)]]
+		(let [x_v x_i] (compile-expr* b c_t c x))
+		(defn extract-elem [t i] (match x_v
+			((# ValSem op)
+				(let j (builder-gi b))
+				(set x_v (ValSem (LocalOp t j)))
+				(set x_i (concat x_i [(Assign j (ExValue op [i]))]))
+			)
+			((# RefSem op)
+				(let j (builder-gi b))
+				(set x_v (RefSem (LocalOp (RawPtr t) j)))
+				(set x_i (concat x_i [(Assign j (ExPtr op [(IntOp 0) (IntOp i)]))]))
+			)
+		))
+		(each (fn [id] (match (sem-type x_v)
+			((# Struct . m)
+				(let [t i] (. m id))
+				(extract-elem t i)
+			)
+			((# RawTuple ts)
+				(extract-elem (. ts id) id)
+			)
+			((# RawArray t .)
+				(let [x_vʹ x_iʹ] (force-ref b x_v))
+				(let [id_v id_i] (compile-expr b c_t c id))
+				(let i (builder-gi b))
+				(set x_v (RefSem (LocalOp (RawPtr t) i)))
+				(set x_i (concat x_i x_iʹ id_i [(Assign i (ExPtr x_vʹ [(IntOp 0) id_v]))]))
+			)
+			((# RawPtr t)
+				(let [x_vʹ x_iʹ] (force-val b x_v))
+				(let [id_v id_i] (if (= id '->) [(IntOp 0) []] (compile-expr b c_t c id)))
+				(let i (builder-gi b))
+				(set x_v (RefSem (LocalOp (RawPtr t) i)))
+				(set x_i (concat x_i x_iʹ id_i [(Assign i (ExPtr x_vʹ [id_v]))]))
+			)
+		)) ids)
+		[x_v x_i]
+	)]
+	['& (fn [b c_t c [x]]
+		(let [x_v x_i] (compile-lvalue b c_t c x))
+		[(ValSem x_v) x_i]
+	)]
+	['∧ (fn [b c_t c [x y]]
+		(let x_label (builder-gl b))
+		(let y_label (builder-gl b))
+		(let cont_label (builder-gl b))
+		(let [x_v x_i] (compile-expr-coerce b c_t c bool x))
+		(let [y_v y_i] (compile-expr-coerce b c_t c bool y))
+		(let i (builder-gi b))
+		[(ValSem (LocalOp bool i)) (concat
+			[(Br x_label) x_label]
+			x_i
+			[(Bz x_v y_label cont_label) y_label]
+			y_i
+			[(Br cont_label) cont_label (Assign i (Phi bool [[x_v (last-label x_label x_i)] [y_v (last-label y_label y_i)]]))]
+		)]
+	)]
+	['∨ (fn [b c_t c [x y]]
+		(let x_label (builder-gl b))
+		(let y_label (builder-gl b))
+		(let cont_label (builder-gl b))
+		(let [x_v x_i] (compile-expr-coerce b c_t c bool x))
+		(let [y_v y_i] (compile-expr-coerce b c_t c bool y))
+		(let i (builder-gi b))
+		[(ValSem (LocalOp bool i)) (concat
+			[(Br x_label) x_label]
+			x_i
+			[(Bz x_v cont_label y_label) y_label]
+			y_i
+			[(Br cont_label) cont_label (Assign i (Phi bool [[x_v (last-label x_label x_i)] [y_v (last-label y_label y_i)]]))]
+		)]
+	)]
+	['undef (fn [b c_t c [t]]
+		[(ValSem (UndefOp (compile-type c_t t))) []]
+	)]
+	['list (fn [b c_t c [t (… args)]]
+		(let [args_v args_i] (compile-exprs b c_t c args))
+		(let t_a (RawArray (compile-type c_t t) (len args)))
+		(let op (UndefOp t_a))
+		(let ops_i (mapi (fn [x i]
+			(let j (builder-gi b))
+			(let next (InValue op x i))
+			(set op (LocalOp t_a j))
+			(Assign j next)
+		) args_v))
+		[(ValSem op) (concat args_i ops_i)]
+	)]
+	['alloca (fn [b c_t c [t n]]
+		(let tʹ (compile-type c_t t))
+		(let [n_v n_i] (compile-expr b c_t c n))
+		(let i (builder-gi b))
+		[(ValSem (LocalOp (RawPtr tʹ) i)) (concat n_i [(Assign i (Alloca tʹ n_v))])]
+	)]
+	['as (fn [b c_t c [x t]]
+		(let [x_v x_i] (compile-expr b c_t c x))
+		(match [(op-type x_v) (compile-type c_t t)]
+			([(# RawInt n) (@ tʹ (# RawInt m))]
+				(cond
+					((> n m)
+						(let i (builder-gi b))
+						[(ValSem (LocalOp tʹ i)) (concat x_i [(Assign i (Trunc x_v tʹ))])]
+					)
+					((< n m)
+						(let i (builder-gi b))
+						[(ValSem (LocalOp tʹ i)) (concat x_i [(Assign i (ZExt x_v tʹ))])]
+					)
+					((= n m) [(ValSem x_v) x_i])
+				)
+			)
+			([(# RawPtr .) (@ tʹ (# RawPtr .))]
+				(let i (builder-gi b))
+				[(ValSem (LocalOp tʹ i)) (concat x_i [(BitCast x_v tʹ)])]
+			)
+			([(# RawInt .) (@ tʹ (# RawPtr .))]
+				(let i (builder-gi b))
+				[(ValSem (LocalOp tʹ i)) (concat x_i [(IntToPtr x_v tʹ)])]
+			)
+			([(# RawPtr .) (@ tʹ (# RawInt .))]
+				(let i (builder-gi b))
+				[(ValSem (LocalOp tʹ i)) (concat x_i [(PtrToInt x_v tʹ)])]
+			)
+		)
+	)]
+	['sizeof (fn [b c_t c [t]]
+		(if (= (typeof t) Str)
+			[(ValSem (IntOp (len t))) []]
+			[(ValSem (IntOp (sizeof (compile-type c_t t)))) []]
+		)
+	)]
+	['fn (fn [b c_t c [['list (… args)] ret (… body)]]
+		(let name (builder-gg b))
+		(let val (compile-func-header c_t c name args ret))
+		(compile-func (builder-mb b) c_t c name args ret body)
+		[val []]
+	)]
+))
+
+(defn compile-expr* [b c_t c expr] (match expr
+	([f (… args)]
+		(if (has ops f) {
+			((. ops f) b c_t c args)
+		} {
+			(let [f_v f_i] (compile-expr* b c_t c f))
+			(if (= (typeof f_v) MacroSem) {
+				(let (# MacroSem m) f_v)
+				(compile-expr* b c_t c (apply m args))
+			} {
+				(let [f_vʹ f_iʹ] (force-val b f_v))
+				(let (# RawPtr (# RawFn t t_args)) (op-type f_vʹ))
+				(let args-comp (mapi (fn [x i] (compile-expr-coerce b c_t c (. t_args i) x)) args))
+				(let args_v (map fst args-comp))
+				(let args_i (concat-map (fn [[. i]] i) args-comp))
+				(if (= (typeof t) Void) {
+					[(ValSem (UndefOp (Void))) (concat f_i f_iʹ args_i [(Call f_vʹ args_v)])]
+				} {
+					(let i (builder-gi b))
+					[(ValSem (LocalOp t i)) (concat f_i f_iʹ args_i [(Assign i (Call f_vʹ args_v))])]
+				})
+			})
+		})
+	)
+	((# Sym sym) [(get-context c sym) []])
+	((# Char c) [(ValSem (IntOp (int c))) []])
+	((# Int i) [(ValSem (IntOp i)) []])
+	((# Bool b) [(ValSem (BoolOp b)) []])
+	((# Str s)
+		(let s_op (StrOp s))
+		(let t (op-type s_op))
+		(let i (builder-gg b))
+		(let i_op (GlobalOp (RawPtr t) i))
+		(builder-pg b (Static i s_op))
+		[(ValSem (BitCastOp (GlobalOp (RawPtr t) i) (RawPtr i8))) []]
+	)
+))
+
+(defn compile-lvalue (@ args [b (… .)])
+	(let [x_v x_i] (apply compile-expr* args))
+	(let [x_vʹ x_iʹ] (force-ref b x_v))
+	[x_vʹ (concat x_i x_iʹ)]
+)
+
+(defn compile-expr (@ args [b (… .)])
+	(let [x_v x_i] (apply compile-expr* args))
+	(let [x_vʹ x_iʹ] (force-val b x_v))
+	[x_vʹ (concat x_i x_iʹ)]
+)
+
+(defn compile-exprs [b c_t c exprs]
+	(let exprs-comp (map (fn [x] (compile-expr b c_t c x)) exprs))
+	[(map fst exprs-comp) (concat-map (fn [[. i]] i) exprs-comp)]
+)
+
+(let sops (Map
+	['return (fn [b c_t c args]
+		(if (= 0 (len args))
+			[c [(Ret (VoidOp)) (builder-gl b)]]
+			{
+				(let [x_v x_i] (compile-expr b c_t c (. args 0)))
+				[c (concat x_i [(Ret x_v) (builder-gl b)])]
+			}
+		)
+	)]
+	['let (fn [b c_t c [name x]]
+		(let [x_v x_i] (compile-expr b c_t c x))
+		(let t (op-type x_v))
+		(let i (builder-gi b))
+		(let op (LocalOp (RawPtr t) i))
+		[(add-context c name (RefSem op)) (concat x_i [(Assign i (Alloca t)) (Store x_v op)])]
+	)]
+	['set (fn [b c_t c [name x]]
+		(let [dest_v dest_i] (compile-lvalue b c_t c name))
+		(let (# RawPtr t) (op-type dest_v))
+		(let [x_v x_i] (compile-expr-coerce b c_t c t x))
+		[c (concat dest_i x_i [(Store x_v dest_v)])]
+	)]
+	['brace (fn [b c_t c stmts]
+		[c (compile-stmts b c_t c stmts)]
+	)]
+	['while (fn [b c_t c [cond stmt]]
+		(let top_label (builder-gl b))
+		(let body_label (builder-gl b))
+		(let end_label (builder-gl b))
+		(let [cond_v cond_i] (compile-expr b c_t c cond))
+		(let [. body] (compile-stmt b c_t c stmt))
+		[c (concat
+			[(Br top_label) top_label]
+			cond_i
+			[(Bz cond_v body_label end_label) body_label]
+			body
+			[(Br top_label) end_label]
+		)]
+	)]
+	['if (fn [b c_t c [cond stmt1 stmt2]]
+		(let [cond_v cond_i] (compile-expr-coerce b c_t c bool cond))
+		(let true_label (builder-gl b))
+		(let false_label (builder-gl b))
+		(let end_label (builder-gl b))
+		(let [. body1] (compile-stmt b c_t c stmt1))
+		(let [. body2] (compile-stmt b c_t c stmt2))
+		[c (concat
+			cond_i
+			[(Bz cond_v true_label false_label) true_label]
+			body1
+			[(Br end_label) false_label]
+			body2
+			[(Br end_label) end_label]
+		)]
+	)]
+	['switch (fn [b c_t c [x (… args)]]
+		; TODO: implement matching on non-terminal element for this
+		(let default (. args (- (len args) 1)))
+		(set args (sub args 0 (- (len args) 1)))
+		(let [x_v x_i] (compile-expr b c_t c x))
+		(let t (op-type x_v))
+		(let default_label (builder-gl b))
+		(let end_label (builder-gl b))
+		(let blocks (map (fn [[n (… stmts)]]
+			(let [n_v []] (compile-expr-coerce b c_t c t n))
+			(let l (builder-gl b))
+			[l n_v (concat [l] (compile-stmts b c_t c stmts) [(Br end_label)])]
+		) args))
+		(let [. default_i] (compile-stmt b c_t c default))
+		[c (concat
+			x_i
+			[(Switch x_v default_label (map (fn [[l op .]] [op l]) blocks))]
+			(concat-map (fn [[. . i]] i) blocks)
+			[default_label]
+			default_i
+			[(Br end_label) end_label]
+		)]
+	)]
+	['fn (fn [b c_t c [name ['list (… args)] ret (… body)]]
+		(let nameʹ (builder-gg b name))
+		(let val (compile-func-header c_t c nameʹ args ret))
+		(set c (add-context c name val))
+		(compile-func (builder-mb b) c_t c nameʹ args ret body)
+		[c []]
+	)]
+	['macro (fn [b c_t c [name args (… body)]]
+		[(add-context c name (MacroSem (func args body))) []]
+	)]
+))
+
+(defn compile-stmt [b c_t c stmt] (match stmt
+	([name (… args)] (if (has sops name)
+		((. sops name) b c_t c args)
+		{
+			(let m? (get-context? c name))
+			(if (= MacroSem (typeof m?)) {
+				(let (# MacroSem f) m?)
+				(compile-stmts* b c_t c (pack (apply f args)))
+			} {
+				(let [x_v x_i] (compile-expr b c_t c stmt))
+				[c x_i]
+			})
+		}
+	))
+	([] [c []])
+))
+
+(defn compile-stmts* [b c_t c body]
+	(let i 0)
+	(let insts [])
+	(while (< i (len body))
+		(let [c_p insts_p] (compile-stmt b c_t c (. body i)))
+		(set c c_p)
+		(set insts (concat insts insts_p))
+		(set i (+ i 1))
+	)
+	[c insts]
+)
+
+(defn compile-stmts args
+	(let [. insts] (apply compile-stmts* args))
+	insts
+)
+
+(defn compile-type [c expr]
+	(defn comp [t]
+		(compile-type c t)
+	)
+	(match expr
+		((# Sym sym) (get-context c sym))
+		(['* t] (RawPtr (comp t)))
+		(['→ ['list (… args_t)] ret_t] (RawPtr (RawFn (comp ret_t) (map comp args_t))))
+		(['list t n] (RawArray (compile-type c t) n))
+		(['brace (… args)] (RawTuple (map comp args)))
+	)
+)
+
+(let dops1 (Map
+	['struct (fn [[name (… .)]]
+		[name (alloc Struct 2 name)]
+	)]
+	['union (fn [[name (… .)]]
+		[name (alloc Struct 3 name)]
+	)]
+	['opaque (fn [[name]]
+		[name (Opaque name)]
+	)]
+))
+
+(let dops2 (Map
+	['fn (fn [mb c_t [name ['list (… args)] ret (… .)]]
+		[[name (ValSem (GlobalOp (RawPtr (RawFn (compile-type c_t ret) (map (fn [[. x]] (compile-type c_t x)) args))) (builder-gg mb name)))]]
+	)]
+	['extern (fn [mb c_t [name ['list (… args)] ret]]
+		[[name (ValSem (GlobalOp (RawPtr (RawFn (compile-type c_t ret) (map (fn [x] (compile-type c_t x)) args))) name))]]
+	)]
+	['enum (fn [mb c_t fields]
+		(let start 1)
+		(map (fn [field] (match field
+			([name i]
+				(set start i)
+				[name (ValSem (IntOp i))]
+			)
+			((# Sym name)
+				(let i start)
+				(set start (+ i 1))
+				[name (ValSem (IntOp i))]
+			)
+		)) fields)
+	)]
+	['static (fn [mb c_t [name type]]
+		(let t (compile-type c_t type))
+		(let nameʹ (builder-gg mb name))
+		(builder-pg mb (Static nameʹ (UndefOp t)))
+		[[name (RefSem (GlobalOp (RawPtr t) nameʹ))]]
+	)]
+))
+
+(defn compile-context [mb c decls]
+	(let types (filter (fn [decl] (has dops1 (. decl 0))) decls))
+	(let c_t (Context builtin-types (apply Map (map (fn [[type (… args)]] ((. dops1 type) args)) types))))
+	(each (fn [decl]
+		(match decl
+			(['struct name (… fields)]
+				(let obj (get-context c_t name))
+				(← obj 1 (apply Map (mapi (fn [[fname expr] i] [fname [(compile-type c_t expr) i]]) fields)))
+			)
+			(['union name (… fields)]
+				(let obj (get-context c_t name))
+				(let max 0)
+				(let m (apply Map (mapi (fn [[fname expr] i]
+					(let t (compile-type c_t expr))
+					(let size (sizeof t))
+					(when (> size max)
+						(set max size)
+					)
+					[fname [t i]]
+				) fields)))
+				(← obj 1 (RawArray i8 max))
+				(← obj 2 m)
+			)
+			(['opaque (… .)] ())
+		)
+	) types)
+	(set c (Context c (apply Map (concat-map (fn [[type (… args)]]
+		(if (has dops2 type) ((. dops2 type) mb c_t args) [])
+	) decls))))
+	[c_t c]
+)
+
+(defn compile-func-header [c_t c name args ret]
+	(ValSem (GlobalOp (RawPtr (RawFn (compile-type c_t ret) (map (fn [[. x]] (compile-type c_t x)) args))) name))
+)
+
+(defn compile-func [mb c_t c name args ret body]
+	; TODO: figure out how to filter out the local scope from these context objects
+	(let ret_t (compile-type c_t ret))
+	(let t (RawFn ret_t (map (fn [[. x]] (compile-type c_t x)) args)))
+	(let b (func-builder mb))
+	(let c_p (Context c
+		(apply Map (map (fn [[name type]] [name (ValSem (LocalOp (compile-type c_t type) (builder-gi b)))]) args))))
+	(let insts (if (= (typeof ret_t) Void)
+		(concat (compile-stmts b c_t c_p body) [(Ret (VoidOp))])
+		{
+			(let insts (compile-stmts b c_t c_p body))
+			(sub insts 0 (- (len insts) 1))
+		}
+	))
+	(builder-pg mb (Func name t (concat [(builder-gl b)] insts)))
+)
+
+(let dops3 (Map
+	['fn (fn [mb c_t c [name ['list (… args)] ret (… body)]]
+		(let (# ValSem (# GlobalOp . nameʹ)) (get-context c name))
+		(compile-func mb c_t c nameʹ args ret body)
+	)]
+	['extern (fn [mb c_t c [name ['list (… args)] ret]]
+		(let t (RawFn (compile-type c_t ret) (map (fn [x] (compile-type c_t x)) args)))
+		(builder-pg mb (Extern name t))
+	)]
+	['struct (fn [mb c_t c [name (… .)]]
+		(builder-pg mb (get-context c_t name))
+	)]
+	['opaque (fn [mb c_t c [name]]
+		(builder-pg mb (get-context c_t name))
+	)]
+))
+
+(defn compile-decl [mb c_t c [type (… args)]]
+	(if (has dops3 type) ((. dops3 type) mb c_t c args) [])
+)
+
+(defn compile-module [decls]
+	(let mb (module-builder))
+	(let d (Nil))
+	(let macros (Map))
+	(defn expand_macro [decl]
+		(cond
+			((= 'macro (. decl 0))
+				(let ['macro name args (… body)] decl)
+				(set macros (insert macros name (MacroSem (func args body))))
+			)
+			((has macros (. decl 0))
+				(let [name (… args)] decl)
+				(let (# MacroSem f) (. macros name))
+				(each expand_macro (pack (apply f args)))
+			)
+			(⊤ (set d (:: decl d)))
+		)
+	)
+	(each expand_macro decls)
+	(set decls (llist-flatten d))
+	(let [c_t c] (compile-context mb (Context ◎ macros) decls))
+	(each (fn [decl] (compile-decl mb c_t c decl)) decls)
+	(Module (builder-ug mb))
+)
+
+(defn stage2 [decls]
+	(puts (llvm-show-module (compile-module decls)))
+	(newline)
+)
+
+; ======== ;
+___stage2___
+; ======== ;
+
+(extern malloc [i32] (* i8))
+(extern realloc [(* i8) i32] (* i8))
+(extern free [(* i8)] void)
+(extern memcpy [(* i8) (* i8) i32] (* i8))
+(extern strlen [(* i8)] i32)
+(extern exit [i32] void)
+(extern write [i32 (* i8) i32] i64)
+
+(opaque Trie)
+(extern trie_new [] (* Trie))
+(extern trie_lookup [(* Trie) (* i8) i32] (* i8))
+(extern trie_insert_copy [(* Trie) (* i8) i32 (* i8)] (* Trie))
+(extern trie_insert_mut [(* Trie) (* i8) i32 (* i8)] void)
+(extern trie_iter [(* Trie) (→ [i32 (* i8) (* i8) (* i8)] void) (* i8)] void)
+(extern trie_debug_print [(* Trie)] void)
+(fn trie_union [(s1 (* Trie)) (s2 (* Trie))] (* Trie)
+	(let ret (trie_new))
+	(fn insert [(len i32) (prefix (* i8)) (value (* i8)) (data (* i8))] void
+		(let ret (as data (* Trie)))
+		(trie_insert_mut ret prefix len value)
+	)
+	(trie_iter s1 insert (as ret (* i8)))
+	(trie_iter s2 insert (as ret (* i8)))
+	(return ret)
+)
+
+(extern util_decode_utf8 [(* i8) (* i32) (* i32)] void)
+(extern util_encode_utf8 [i32 (* i8) (* i32)] void)
+(extern debug_print_binary [i8] void)
+(extern putstr [(* i8)] void)
+(extern putstrln [(* i8)] void)
+(extern eputstr [(* i8)] void)
+(extern eputstrln [(* i8)] void)
+
+(macro cast [x y]
+	`(. (as (& ʹx) (* ʹy)) 0)
+)
+(macro -> [x (… args)]
+	(concat `(. ʹx 0) args)
+)
+(macro * [x (… args)]
+	`(. ʹx 0)
+)
+(macro &* [x]
+	`(& (. ʹx 0))
+)
+(macro *as [x t]
+	`(* (as ʹx (* ʹt)))
+)
+(macro &as [x t]
+	`(as (& ʹx) (* ʹt))
+)
+(macro &void [x]
+	`(as (& ʹx) (* i8))
+)
+(macro null-ptr []
+	`(as 0 (* i8))
+)
+(macro ¬ [x] `(= ʹx ⊥))
+(macro assert [expr] `(when (¬ ʹexpr) { (error ʹ(concat “assertion failed: ” (show expr)))}))
+(macro when [cond (… body)]
+	`(if ʹcond { ʺbody } ())
+)
+(macro cond args
+	(defn inner [[cond (… body)] (… rest)]
+		(let else (if (= 0 (len rest)) '() (apply inner rest)))
+		`(if ʹcond { ʺbody } ʹelse)
+	)
+	(apply inner args)
+)
+
+(macro gen-set [name t] (,
+	`(macro ʹ(concat name '_has) [s key] `(≠ (as (trie_lookup ʹ'ʹs (&as ʹ'ʹkey i8) (sizeof ʹt)) i64) 0))
+	`(macro ʹ(concat name '_insert) [s key] `(trie_insert_copy ʹ'ʹs (&as ʹ'ʹkey i8) (sizeof ʹt) (as 1 (* i8))))
+	`(macro ʹ(concat name '_insert_mut) [s key] `(trie_insert_mut ʹ'ʹs (&as ʹ'ʹkey i8) (sizeof ʹt) (as 1 (* i8))))
+))
+(macro gen-map [name t1 t2] (,
+	`(macro ʹ(concat name '_get) [m key] `(cast (trie_lookup ʹ'ʹm (&as ʹ'ʹkey i8) (sizeof ʹt1)) ʹt2))
+	`(macro ʹ(concat name '_has) [m key] `(≠ (as (trie_lookup ʹ'ʹm (&as ʹ'ʹkey i8) (sizeof ʹt1)) i64) 0))
+	`(macro ʹ(concat name '_insert) [m key val] `(trie_insert_copy ʹ'ʹm (&as ʹ'ʹkey i8) (sizeof ʹt1) (cast ʹ'ʹval (* i8))))
+	`(macro ʹ(concat name '_insert_mut) [m key val] `(trie_insert_mut ʹ'ʹm (&as ʹ'ʹkey i8) (sizeof ʹt1) (cast ʹ'ʹval (* i8))))
+))
+(macro gen-map-unique [name t1 t2] (,
+	`(gen-map ʹ(concat name '_) ʹt1 ʹt2)
+	`(static ʹname (* Trie))
+	`(macro ʹ(concat name '_get) [key] `(ʹ(concat name '__get) ʹname ʹ'ʹkey))
+	`(macro ʹ(concat name '_has) [key] `(ʹ(concat name '__has) ʹname ʹ'ʹkey))
+	`(macro ʹ(concat name '_insert) [key val] `(ʹ(concat name '__insert_copy) ʹname ʹ'ʹkey ʹ'ʹval))
+	`(macro ʹ(concat name '_insert_mut) [key val] `(ʹ(concat name '__insert_mut) ʹname ʹ'ʹkey ʹ'ʹval))
+))
+(macro gen-llist [name t]
+	(let T (concat name))
+	(,
+		`(struct ʹT
+			(next (* ʹT))
+			(end bool)
+			(val ʹt)
+		)
+
+		`(fn ʹ(concat name '_nil) [] (* ʹT)
+			(let ret (as (malloc (sizeof ʹT)) (* ʹT)))
+			(set (-> ret end) ⊤)
+			(return ret)
+		)
+
+		`(fn ʹ(concat name '_cons) [(x ʹt) (next (* ʹT))] (* ʹT)
+			(let ret (as (malloc (sizeof ʹT)) (* ʹT)))
+			(set (* ret) (# ʹT next ⊥ x))
+			(return ret)
+		)
+
+		`(fn ʹ(concat name '_len) [(l (* ʹT))] i32
+			(let lʹ l)
+			(let i 0)
+			(while (¬ (-> lʹ end)) {
+				(set i (+ i 1))
+				(set lʹ (-> lʹ next))
+			})
+			(return i)
+		)
+
+		`(fn ʹ(concat name '_flatten) [(l (* ʹT)) (last (* ʹt))] void
+			(let lʹ l)
+			(let cell last)
+			(while (¬ (-> lʹ end)) {
+				(set (* cell) (-> lʹ val))
+				(set cell (& (. cell (- 0 1))))
+				(set lʹ (-> lʹ next))
+			})
+		)
+	)
+)
+
+(macro error args `{
+	(putstr “error: ”)
+	ʺ(map (fn [arg] `(putstr ʹarg)) args)
+	(putstr “\n”)
+	(exit 1)
+})
+
+; ====== ;
+; Values ;
+; ====== ;
+
+(enum
+	(PRIM 0xaaaa)
+)
+
+(enum
+	NULL
+	BOOL
+	INT
+	CHAR
+	SYM
+	SET
+	MAP
+	LIST
+	TUP
+	STR
+	FUNC
+	TYPE
+	OBJ
+)
+
+(struct Val
+	(val i32)
+	(tag i16)
+	(fix i16)
+)
+
+(struct Value
+	(tag i32)
+)
+
+(struct Set
+	(tag i32)
+	(trie (* Trie))
+)
+
+(struct Map
+	(tag i32)
+	(trie (* Trie))
+)
+
+(struct List
+	(tag i32)
+	(len i32)
+	(capacity i32)
+)
+
+(struct Str
+	(tag i32)
+	(len i32)
+	(capacity i32)
+)
+
+(struct Match
+	(tag i32)
+)
+
+(gen-llist scopes (* Trie))
+
+(struct Func
+	(tag i32)
+	(macro bool)
+	(builtin bool)
+	(scopes (* scopes))
+	(args (* Match))
+	(len i32)
+)
+
+(struct BuiltinFunc
+	(tag i32)
+	(macro bool)
+	(builtin bool)
+	(f (→ [i32 (* Val)] Val))
+)
+
+(struct Type
+	(tag i32)
+	(builtin bool)
+	(name Val)
+)
+
+(struct BuiltinType
+	(tag i32)
+	(builtin bool)
+	(name Val)
+	(id i32)
+)
+
+(struct Obj
+	(tag i32)
+	(len i32)
+	(type (* Type))
+)
+
+(fn is_prim [(x Val)] bool
+	(return (= (. x fix) PRIM))
+)
+
+(fn get_tag [(x Val)] i32
+	(if (is_prim x)
+		(return (as (. x tag) i32))
+		(return (-> (cast x (* Value)) tag))
+	)
+	(return (undef i32))
+)
+
+(fn Null [] Val
+	(return (# Val 0 NULL PRIM))
+)
+
+(fn Bool [(b bool)] Val
+	(return (# Val b BOOL PRIM))
+)
+
+(fn Int [(i i32)] Val
+	(return (# Val i INT PRIM))
+)
+
+(fn Char [(c i32)] Val
+	(return (# Val c CHAR PRIM))
+)
+
+(fn int_of_val [(x Val)] Val
+	(macro return-raw [] `(return (Int (. x val))))
+	(switch (get_tag x)
+		(BOOL (return-raw))
+		(CHAR (return-raw))
+		(INT (return-raw))
+		(SYM (return (sym_to_int x)))
+		()
+	)
+	(error “can not convert to int”)
+	(return (undef Val))
+)
+
+(gen-map-unique sym_table i32 (* Str))
+
+(static sym_table (* Trie))
+(fn init_sym_table [] void
+	(set sym_table (trie_new))
+)
+
+(extern strcmp [(* i8) (* i8)] i32)
+
+(fn sym_table_hash [(s (* Str))] i32
+	(let h (hash (cast s Val)))
+	(sym_table_insert_mut h s)
+	(return h)
+)
+
+(fn sym_table_str [(h i32)] (* Str)
+	(return (sym_table_get h))
+)
+
+(fn sym_of_i32 [(hash i32)] Val
+	(return (# Val hash SYM PRIM))
+)
+
+(fn sym_of_str [(s (* Str))] Val
+	(return (# Val (sym_table_hash s) SYM PRIM))
+)
+
+(fn sym_to_str [(x Val)] (* Str)
+	(return (sym_table_str (. x val)))
+)
+
+(fn sym_to_int [(x Val)] Val
+	(return (Int (. x val)))
+)
+
+(fn Sym [(len i32) (s (* i8))] Val
+	(return (# Val (sym_table_hash (str_of_cstr len s)) SYM PRIM))
+)
+
+(gen-set val_set Val)
+(gen-map val_map Val Val)
+
+(fn set_alloc [] (* Set)
+	(let ret (as (malloc (sizeof Set)) (* Set)))
+	(set (-> ret tag) SET)
+	(return ret)
+)
+
+(fn set_new [] (* Set)
+	(let ret (set_alloc))
+	(set (-> ret trie) (trie_new))
+	(return ret)
+)
+
+(fn	set_insert_mut [(s (* Set)) (key Val)] void
+	(val_set_insert_mut (-> s trie) key)
+)
+
+(fn	set_insert [(s (* Set)) (key Val)] (* Set)
+	(let ret (set_alloc))
+	(set (-> s trie) (val_set_insert (-> s trie) key))
+	(return ret)
+)
+
+(fn	set_has [(s (* Set)) (key Val)] bool
+	(return (val_set_has (-> s trie) key))
+)
+
+(fn set_iter [(s (* Set)) (f (→ [Val (* i8)] void)) (data (* i8))] void
+	(let state (, f data))
+	(trie_iter (-> s trie) (fn [(len i32) (key (* i8)) (value (* i8)) (data (* i8))] void
+		(let state (*as data {(→ [Val (* i8)] void) (* i8)}))
+		((. state 0) (*as key Val) (. state 1))
+	) (&as state i8))
+)
+
+(fn set_union [(s1 (* Set)) (s2 (* Set))] (* Set)
+	(let ret (as (malloc (sizeof Set)) (* Set)))
+	(set (-> ret tag) SET)
+	(set (-> ret trie) (trie_union (-> s1 trie) (-> s2 trie)))
+	(return ret)
+)
+
+(fn map_alloc [] (* Map)
+	(let ret (as (malloc (sizeof Map)) (* Map)))
+	(set (-> ret tag) MAP)
+	(return ret)
+)
+
+(fn map_new [] (* Map)
+	(let ret (map_alloc))
+	(set (-> ret trie) (trie_new))
+	(return ret)
+)
+
+(fn map_insert [(m (* Map)) (key Val) (val Val)] (* Map)
+	(let ret (map_alloc))
+	(set (-> ret trie) (val_map_insert (-> m trie) key val))
+	(return ret)
+)
+
+(fn map_insert_mut [(m (* Map)) (key Val) (val Val)] void
+	(val_map_insert_mut (-> m trie) key val)
+)
+
+(fn	map_has [(m (* Map)) (key Val)] bool
+	(return (val_map_has (-> m trie) key))
+)
+
+(fn	map_get [(m (* Map)) (key Val)] Val
+	(return (val_map_get (-> m trie) key))
+)
+
+(fn map_iter [(m (* Map)) (f (→ [Val Val (* i8)] void)) (data (* i8))] void
+	(let state (, f data))
+	(trie_iter (-> m trie) (fn [(len i32) (key (* i8)) (value (* i8)) (data (* i8))] void
+		(let state (*as data {(→ [Val Val (* i8)] void) (* i8)}))
+		((. state 0) (*as key Val) (cast value Val) (. state 1))
+	) (&as state i8))
+)
+
+(fn map_union [(m1 (* Map)) (m2 (* Map))] (* Map)
+	(let ret (as (malloc (sizeof Map)) (* Map)))
+	(set (-> ret tag) MAP)
+	(set (-> ret trie) (trie_union (-> m1 trie) (-> m2 trie)))
+	(return ret)
+)
+
+(fn at_least_pow2 [(n i32)] i32
+	(when (= n 0) (return 0))
+	(let m n)
+	(let i 0)
+	(while (≠ m 0) {
+		(set m (>> m 1))
+		(set i (+ i 1))
+	})
+	(return (<< 1 i))
+)
+
+(fn str_alloc [(n i32)] (* Str)
+	(let capacity (at_least_pow2 (+ n 1)))
+	(let ret (as (malloc (+ (sizeof Str) capacity)) (* Str)))
+	(set (-> ret tag) STR)
+	(set (-> ret len) n)
+	(set (-> ret capacity) capacity)
+	(return ret)
+)
+
+(fn str_empty [] (* Str)
+	(return (str_alloc 0))
+)
+
+(fn str_realloc [(s (* Str)) (n i32)] (* Str)
+	(let new_capacity (at_least_pow2 (+ n 1)))
+	(let ret s)
+	(when (> new_capacity (-> s capacity))
+		(set ret (as (realloc (as s (* i8)) (+ (sizeof Str) new_capacity)) (* Str)))
+		(set (-> ret capacity) new_capacity)
+	)
+	(return ret)
+)
+
+(fn str_append_char [(s (* Str)) (ch i32)] (* Str)
+	(let len (undef i32))
+	(let encoding (undef [i8 4]))
+	(util_encode_utf8 ch (&* encoding) (& len))
+	(return (str_append_cstr s len (&* encoding)))
+)
+
+(fn str_append_cstr [(s (* Str)) (len i32) (data (* i8))] (* Str)
+	(let old_len (-> s len))
+	(let new_len (+ old_len len))
+	(let ret (str_realloc s new_len))
+	(set (-> ret len) new_len)
+	(let end (& (. (str_to_cstr ret) old_len)))
+	(memcpy end data len)
+	(set (. end len) "\0)
+	(return ret)
+)
+
+(fn str_append [(s1 (* Str)) (s2 (* Str))] (* Str)
+	(return (str_append_cstr s1 (-> s2 len) (str_to_cstr s2)))
+)
+
+(fn str_to_cstr [(s (* Str))] (* i8)
+	(return (&as (. s 1) i8))
+)
+
+(fn str_of_val [(x Val)] (* Str)
+	(switch (get_tag x)
+		(STR (return (cast x (* Str))))
+		(SYM (return (sym_to_str x)))
+		()
+	)
+	(return (show x))
+)
+
+(fn str_of_cstr [(n i32) (s (* i8))] (* Str)
+	(let ret (str_alloc n))
+	(let cstr (str_to_cstr ret))
+	(memcpy cstr s n)
+	(set (. cstr n) "\0)
+	(return ret)
+)
+
+(fn list_alloc [(n i32)] (* List)
+	(let capacity (at_least_pow2 (× n (sizeof Val))))
+	(let ret (as (malloc (+ (sizeof List) capacity)) (* List)))
+	(set (-> ret tag) LIST)
+	(set (-> ret len) n)
+	(set (-> ret capacity) capacity)
+	(return ret)
+)
+
+(fn list_empty [] (* List)
+	(return (list_alloc 0))
+)
+
+(fn list_realloc [(l (* List)) (n i32)] (* List)
+	(let new_capacity (at_least_pow2 (× n (sizeof Val))))
+	(let ret l)
+	(when (> new_capacity (-> l capacity))
+		(set ret (as (realloc (as l (* i8)) (+ (sizeof List) new_capacity)) (* List)))
+		(set (-> ret capacity) new_capacity)
+	)
+	(return ret)
+)
+
+(fn list_append_val [(l (* List)) (x Val)] (* List)
+	(return (list_append_carray l 1 (& x)))
+)
+
+(fn list_append_carray [(l (* List)) (len i32) (data (* Val))] (* List)
+	(let old_len (-> l len))
+	(let new_len (+ old_len len))
+	(let ret (list_realloc l new_len))
+	(set (-> ret len) new_len)
+	(let end (&as (. (list_to_carray ret) old_len) i8))
+	(memcpy end (as data (* i8)) (× len (sizeof Val)))
+	(return ret)
+)
+
+(fn list_append [(l1 (* List)) (l2 (* List))] (* List)
+	(return (list_append_carray l1 (-> l2 len) (list_to_carray l2)))
+)
+
+(fn list_of_carray [(len i32) (l (* Val))] (* List)
+	(let ret (list_alloc len))
+	(memcpy (as (list_to_carray ret) (* i8)) (as l (* i8)) (× len (sizeof Val)))
+	(return ret)
+)
+
+(fn list_copy [(l (* List))] (* List)
+	(let size (+ (sizeof List) (× (-> l len) (sizeof Val))))
+	(let ret (malloc size))
+	(memcpy ret (as l (* i8)) size)
+	(return (as ret (* List)))
+)
+
+(fn tup_of_carray [(len i32) (l (* Val))] Val
+	(let ret (list_empty))
+	(macro push_tups [t len vals] `{
+		(let i 0)
+		(let n ʹlen)
+		(let carray ʹvals)
+		(while (< i n) {
+			(push_tup ʹt (. carray i))
+			(set i (+ i 1))
+		})
+	})
+	(fn push_tup [(t (* (* List))) (x Val)] void
+		(switch (get_tag x)
+			(NULL ())
+			(TUP
+				(let l (cast x (* List)))
+				(push_tups t (-> l len) (list_to_carray l))
+			)
+			(set (* t) (list_append_val (* t) x))
+		)
+	)
+	(push_tups (& ret) len l)
+	(switch (-> ret len)
+		(0 (return '◎))
+		(1 (return (list_get ret 0)))
+		()
+	)
+	(set (-> ret tag) TUP)
+	(return (cast ret Val))
+)
+
+(fn tup_pack [(x Val)] (* List)
+	(switch (get_tag x)
+		(NULL (return (list_empty)))
+		(TUP
+			(let ret (list_copy (cast x (* List))))
+			(set (-> ret tag) LIST)
+			(return ret)
+		)
+		()
+	)
+	(return (list_of_carray 1 (& x)))
+)
+
+(fn tup_unpack [(l (* List))] Val
+	(return (tup_of_carray (-> l len) (list_to_carray l)))
+)
+
+(fn list_to_carray [(l (* List))] (* Val)
+	(return (&as (. l 1) Val))
+)
+
+(fn list_set [(l (* List)) (n i32) (x Val)] void
+	(set (. (list_to_carray l) n) x)
+)
+
+(fn list_get [(l (* List)) (n i32)] Val
+	(return (. (list_to_carray l) n))
+)
+
+(fn func_new [(scopes (* scopes)) (args (* Match)) (len i32) (body (* Val))] (* Func)
+	(let ret (as (malloc (+ (sizeof Func) (× len (sizeof Val)))) (* Func)))
+	(set (-> ret tag) FUNC)
+	(set (-> ret macro) ⊥)
+	(set (-> ret builtin) ⊥)
+	(set (-> ret scopes) scopes)
+	(set (-> ret args) args)
+	(set (-> ret len) len)
+	(memcpy (&as (. ret 1) i8) (as body (* i8)) (× len (sizeof Val)))
+	(return ret)
+)
+
+(fn macro_new [(scopes (* scopes)) (args (* Match)) (len i32) (body (* Val))] (* Func)
+	(let ret (func_new scopes args len body))
+	(set (-> ret macro) ⊤)
+	(return ret)
+)
+
+(fn func_body [(f (* Func))] (* Val)
+	(return (&as (. f 1) Val))
+)
+
+(fn builtin_func_new [(f (→ [i32 (* Val)] Val))] (* BuiltinFunc)
+	(let ret (as (malloc (sizeof BuiltinFunc)) (* BuiltinFunc)))
+	(set (-> ret tag) FUNC)
+	(set (-> ret macro) ⊥)
+	(set (-> ret builtin) ⊤)
+	(set (-> ret f) f)
+	(return ret)
+)
+
+(fn builtin_macro_new [(f (→ [i32 (* Val)] Val))] (* BuiltinFunc)
+	(let ret (builtin_func_new f))
+	(set (-> ret macro) ⊤)
+	(return ret)
+)
+
+(fn type_new [(sym Val)] (* Type)
+	(let ret (as (malloc (sizeof Type)) (* Type)))
+	(set (-> ret tag) TYPE)
+	(set (-> ret builtin) ⊥)
+	(set (-> ret name) sym)
+	(return ret)
+)
+
+(fn builtin_type_new [(sym Val) (id i32)] (* BuiltinType)
+	(let ret (as (malloc (sizeof BuiltinType)) (* BuiltinType)))
+	(set (-> ret tag) TYPE)
+	(set (-> ret builtin) ⊤)
+	(set (-> ret name) sym)
+	(set (-> ret id) id)
+	(return ret)
+)
+
+(fn obj_alloc [(type (* Type)) (n i32)] (* Obj)
+	(let ret (as (malloc (+ (sizeof Obj) (× n (sizeof Val)))) (* Obj)))
+	(set (-> ret tag) OBJ)
+	(set (-> ret len) n)
+	(set (-> ret type) type)
+	(return ret)
+)
+
+(fn obj_of_carray [(type (* Type)) (len i32) (l (* Val))] (* Obj)
+	(let ret (obj_alloc type len))
+	(memcpy (as (obj_to_carray ret) (* i8)) (as l (* i8)) (× len (sizeof Val)))
+	(return ret)
+)
+
+(fn obj_to_carray [(o (* Obj))] (* Val)
+	(return (&as (. o 1) Val))
+)
+
+(fn obj_set [(o (* Obj)) (n i32) (x Val)] void
+	(set (. (obj_to_carray o) n) x)
+)
+
+(fn obj_get [(o (* Obj)) (n i32)] Val
+	(return (. (obj_to_carray o) n))
+)
+
+(macro quote [x] (match x
+	((# Null) `(Null))
+	((# Bool b) `(Bool ʹb))
+	((# Int i) `(Int ʹi))
+	((# Char c) `(Char ʹc))
+	((# Sym sym)
+		(let s (str sym))
+		`(Sym (sizeof ʹs) ʹs)
+	)
+	((# Str s) `(cast (str_of_cstr (sizeof ʹs) ʹs) Val))
+))
+
+(fn equal [(x Val) (y Val)] bool
+	; TODO: implement deep equality
+	(return (= (cast x (* Value)) (cast y (* Value))))
+)
+
+; ======== ;
+; Printing ;
+; ======== ;
+
+(fn show_i64 [(x i64)] (* i8)
+	(let y x)
+	(when (= x 0)
+		(let ret (malloc 2))
+		(set (. ret 0) "0)
+		(set (. ret 1) "\0)
+		(return ret)
+	)
+	(let length 0)
+	(while (≠ y 0) {
+		(set length (+ length 1))
+		(set y (/ y 10))
+	})
+	(let s (malloc (+ length 1)))
+	(set y x)
+	(set (. s length) "\0)
+	(let i (- length 1))
+	(while (≠ y 0) {
+		(set (. s i) (+ "0 (% y 10)))
+		(set y (/ y 10))
+		(set i (- i 1))
+	})
+	(return s)
+)
+
+(struct Stream
+	(append (→ [(* Stream) i32 (* i8)] void))
+)
+
+(struct StringStream
+	(append (→ [(* StringStream) i32 (* i8)] void))
+	(str (* Str))
+)
+
+(fn stream_string [] StringStream
+	(return (# StringStream (fn [(ss (* StringStream)) (len i32) (s (* i8))] void
+		(set (-> ss str) (str_append_cstr (-> ss str) len s))
+	) (str_empty)))
+)
+
+(fn stream_stdout [] Stream
+	(return (# Stream (fn [(ss (* Stream)) (len i32) (data (* i8))] void
+		(write 1 data len)
+	)))
+)
+
+(fn stream_stderr [] Stream
+	(return (# Stream (fn [(ss (* Stream)) (len i32) (data (* i8))] void
+		(write 2 data len)
+	)))
+)
+
+(fn sputchar [(s (* Stream)) (ch i32)] void
+	(let len (undef i32))
+	(let encoding (undef [i8 4]))
+	(util_encode_utf8 ch (&* encoding) (& len))
+	((-> s append) s len (&* encoding))
+)
+
+(fn sputstr [(s (* Stream)) (data (* i8))] void
+	((-> s append) s (strlen data) data)
+)
+
+(fn sprint [(ss (* Stream)) (x Val)] void
+	(macro print-list [ch1 len elem ch2] `{
+		(sputchar ss ʹch1)
+		(let i 0)
+		(let n ʹlen)
+		(while (< i n) {
+			(when (≠ i 0)
+				(sputstr ss “, ”)
+			)
+			(sprint ss ʹelem)
+			(set i (+ i 1))
+		})
+		(sputchar ss ʹch2)
+	})
+	(switch (get_tag x)
+		(NULL
+			(sputstr ss “◎”)
+		)
+		(BOOL
+			(if (. x val)
+				(sputchar ss "⊤)
+				(sputchar ss "⊥)
+			)
+		)
+		(INT
+			(let s (show_i64 (. x val)))
+			(sputstr ss s)
+			(free s)
+		)
+		(CHAR
+			(sputchar ss "")
+			(sputchar ss (. x val))
+		)
+		(SYM
+			(let s (sym_table_str (. x val)))
+			(sputchar ss "‘)
+			(sputstr ss (str_to_cstr s))
+			(sputchar ss "’)
+		)
+		(SET
+			(let s (cast x (* Set)))
+			(sputchar ss "{)
+			(let data (, ⊤ ss))
+			(set_iter s (fn [(x Val) (data (* i8))] void
+				(let data (as data (* {bool (* Stream)})))
+				(let ss (-> data 1))
+				(if (-> data 0)
+					(set (-> data 0) ⊥)
+					(sputstr ss “, ”)
+				)
+				(sprint ss x)
+			) (&as data i8))
+			(sputchar ss "})
+		)
+		(MAP
+			(let m (cast x (* Map)))
+			(sputchar ss "{)
+			(let data (, ⊤ ss))
+			(map_iter m (fn [(key Val) (value Val) (data (* i8))] void
+				(let data (as data (* {bool (* Stream)})))
+				(let ss (-> data 1))
+				(if (-> data 0)
+					(set (-> data 0) ⊥)
+					(sputstr ss “, ”)
+				)
+				(sprint ss key)
+				(sputstr ss “ → ”)
+				(sprint ss value)
+			) (&as data i8))
+			(sputchar ss "})
+		)
+		(STR
+			(let s (cast x (* Str)))
+			(sputchar ss "“)
+			(sputstr ss (str_to_cstr s))
+			(sputchar ss "”)
+		)
+		(LIST
+			(let l (cast x (* List)))
+			(print-list "⟨ (-> l len) (list_get l i) "⟩)
+		)
+		(TUP
+			(let l (cast x (* List)))
+			(print-list "( (-> l len) (list_get l i) "))
+		)
+		(FUNC
+			(sputstr ss “<function>”)
+		)
+		(TYPE
+			(let t (cast x (* Type)))
+			(sputstr ss (str_to_cstr (sym_to_str (-> t name))))
+		)
+		(OBJ
+			(let o (cast x (* Obj)))
+			(sprint ss (cast (-> o type) Val))
+			(print-list "[ (-> o len) (obj_get o i) "])
+		)
+		(error “unimplemented print”)
+	)
+)
+
+(fn show [(x Val)] (* Str)
+	(let ss (stream_string))
+	(sprint (&as ss Stream) x)
+	(return (. ss str))
+)
+
+(fn sprintln [(ss (* Stream)) (x Val)] void (sprint ss x) (sputchar ss "\n))
+(fn print [(x Val)] void (let ss (stream_stdout)) (sprint (& ss) x))
+(fn println [(x Val)] void (let ss (stream_stdout)) (sprintln (& ss) x))
+(fn eprint [(x Val)] void (let ss (stream_stderr)) (sprint (& ss) x))
+(fn eprintln [(x Val)] void (let ss (stream_stderr)) (sprintln (& ss) x))
+
+; ======= ;
+; Hashing ;
+; ======= ;
+
+(extern util_hash_uint32 [i32 i32] i32)
+(extern util_hash_string [i32 i32 (* i8)] i32)
+(extern util_hash_finalize [i32] i32)
+
+(fn hash [(x Val)] i32
+	(fn hash_mix [(seed i32) (x Val)] i32
+		(let h seed)
+		(if (is_prim x) {
+			(set h (util_hash_uint32 h (. x fix)))
+			(set h (util_hash_uint32 h (. x tag)))
+			(set h (util_hash_uint32 h (. x val)))
+		} {
+			(let v (cast x (* Value)))
+			(set h (util_hash_uint32 h (-> v tag)))
+			(switch (-> v tag)
+				(STR
+					(let s (as v (* Str)))
+					(set h (util_hash_string h (-> s len) (str_to_cstr s)))
+				)
+				(SET
+					(let s (as v (* Set)))
+					(set_iter s (fn [(x Val) (data (* i8))] void
+						(let h (as data (* i32)))
+						(set (* h) (hash_mix (* h) x))
+					) (&as h i8))
+				)
+				(MAP
+					(let m (as v (* Map)))
+					(map_iter m (fn [(key Val) (value Val) (data (* i8))] void
+						(let h (as data (* i32)))
+						(set (* h) (hash_mix (* h) key))
+						(set (* h) (hash_mix (* h) value))
+					) (&as h i8))
+				)
+				(error “unimplemented hash”)
+			)
+		})
+		(return h)
+	)
+	(return (util_hash_finalize (hash_mix 0 x)))
+)
+
+; ======= ;
+; Parsing ;
+; ======= ;
+
+(struct Parser
+	(str (* i8))
+	(index i32)
+)
+
+(gen-set charset i32)
+
+(fn charset [(s (* i8))] (* Trie)
+	(let ret (trie_new))
+	(let p (parser_new s))
+	(let ch (parser_look (& p)))
+	(while (≠ ch "\0) {
+		(charset_insert_mut ret ch)
+		(parser_next (& p))
+		(set ch (parser_look (& p)))
+	})
+	(return ret)
+)
+
+(static cs_N (* Trie))
+(static cs_R (* Trie))
+(static cs_V (* Trie))
+(static cs_S (* Trie))
+(static cs_W (* Trie))
+(static cs_I1 (* Trie))
+(static cs_I2 (* Trie))
+(fn init_charsets [] void
+	(set cs_N (charset “0123456789”))
+	(set cs_R (charset “abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZαβγδεζηθικλμνξοπρστυϕχψωΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ”))
+	(set cs_V (charset “𝑎𝑏𝑐𝑑𝑒𝑓𝑔ℎ𝑖𝑗𝑘𝑙𝑚𝑛𝑜𝑝𝑞𝑟𝑠𝑡𝑢𝑣𝑤𝑥𝑦𝑧𝐴𝐵𝐶𝐷𝐸𝐹𝐺𝐻𝐼𝐽𝐾𝐿𝑀𝑁𝑂𝑃𝑄𝑅𝑆𝑇𝑈𝑉𝑊𝑋𝑌𝑍𝛼𝛽𝛾𝛿𝜀𝜁𝜂𝜃𝜄𝜅𝜆𝜇𝜈𝜉𝜊𝜋𝜌𝜎𝜏𝜐𝜙𝜒𝜓𝜔𝛢𝛣𝛤𝛥𝛦𝛧𝛨𝛩𝛪𝛫𝛬𝛭𝛮𝛯𝛰𝛱𝛲𝛴𝛵𝛶𝛷𝛸𝛹𝛺𝕒𝕓𝕔𝕕𝕖𝕗𝕘𝕙𝕚𝕛𝕜𝕝𝕞𝕟𝕠𝕡𝕢𝕣𝕤𝕥𝕦𝕧𝕨𝕩𝕪𝕫𝔸𝔹ℂ𝔻𝔼𝔽𝔾ℍ𝕀𝕁𝕂𝕃𝕄ℕ𝕆ℙℚℝ𝕊𝕋𝕌𝕍𝕎𝕏𝕐ℤ”))
+	(set cs_S (charset “!@#$%^&*-_=+\\|/?:,.<>~†‡⹋§‖¶⁋✢✻❊✣❉🞰🞶🞼✺∇∝×⋅∘⊕⋆…≠≤≥≪≫¬∧∨∩∪∈∉∋∌⊆⊇⊈⊉⊊⊋∖∏∑⋀⋁⋂⋃∅∞←→↑↓↔↮↤↦⇐⇒▷◁△▽○□◇∀∃∄∂∆√∫∴↯±∓–”))
+	(set cs_W (charset “ \t\n”))
+	(set cs_I1 (trie_union cs_R (trie_union cs_V cs_S)))
+	(set cs_I2 (trie_union cs_I1 (trie_union cs_N (charset “ʹʺ”))))
+)
+
+(fn parser_new [(s (* i8))] Parser
+	(return (# Parser s 0))
+)
+
+(fn parser_step [(p (* Parser)) (incr bool)] i32
+	(let code 0)
+	(let len 0)
+	(util_decode_utf8 (& (-> p str (-> p index))) (& code) (& len))
+	(when incr (set (-> p index) (+ (-> p index) len)))
+	(return code)
+)
+
+(fn parser_look [(p (* Parser))] i32
+	(return (parser_step p ⊥))
+)
+
+(fn parser_next [(p (* Parser))] void
+	(parser_step p ⊤)
+)
+
+(fn parser_collect [(p (* Parser)) (s (* Trie))] {i32 (* i8)}
+	(let index (-> p index))
+	(let start (& (-> p str index)))
+	(while (charset_has s (parser_look p)) {
+		(parser_next p)
+	})
+	(return (, (- (-> p index) index) start))
+)
+
+(fn parser_skip_whitespace [(p (* Parser))] void
+	(parser_collect p cs_W)
+	(when (= (parser_look p) ";)
+		(let ch ";)
+		(while (∧ (≠ ch "\n) (≠ ch "\0)) {
+			(parser_next p)
+			(set ch (parser_look p))
+		})
+		(when (≠ ch "\0)
+			(parser_next p)
+			(parser_skip_whitespace p)
+		)
+	)
+)
+
+(fn parser_parse_char [(p (* Parser)) (has_end bool) (end_char i32)] {bool i32}
+	(macro is_end []
+		`(∧ has_end (= ch end_char))
+	)
+	(let ch (parser_look p))
+	(cond
+		((= ch "\0)
+			(error “reached EOF reading char”)
+		)
+		((is_end)
+			(return (, ⊤ (undef i32)))
+		)
+		((= ch "\\)
+			(parser_next p)
+			(set ch (parser_look p))
+			(parser_next p)
+			(cond
+				((∨ (is_end) (= ch "\\))
+					(return (, ⊥ ch))
+				)
+				((= ch "n) (return (, ⊥ "\n)))
+				((= ch "t) (return (, ⊥ "\t)))
+				((= ch "0) (return (, ⊥ "\0)))
+				(⊤ (error “unknown escape”))
+			)
+		)
+		(⊤
+			(parser_next p)
+			(return (, ⊥ ch))
+		)
+	)
+	(return (undef {bool i32}))
+)
+
+(fn parser_parse_string [(p (* Parser)) (end_char i32)] (* Str)
+	(let ret (str_alloc 0))
+	(let cont ⊤)
+	(while cont {
+		(let pair (parser_parse_char p ⊤ end_char))
+		(if (. pair 0) (set cont ⊥) {
+			(set ret (str_append_char ret (. pair 1)))
+		})
+	})
+	(parser_next p)
+	(return ret)
+)
+
+(fn parser_parse_digit [(p (* Parser)) (radix i32)] {bool i32}
+	(let ch (parser_look p))
+	(macro maybe_return [expr] (,
+		`(let x ʹexpr)
+		`(if (< x radix) { (parser_next p) (return (, ⊥ x)) } (return (, ⊤ (undef i32))))
+	))
+	(cond
+		((∧ (≤ "0 ch) (≤ ch "9))
+			(maybe_return (- ch "0))
+		)
+		((∧ (≤ "a ch) (≤ ch "z))
+			(maybe_return (+ (- ch "a) 10))
+		)
+	)
+	(return (, ⊤ (undef i32)))
+)
+
+(fn parser_parse_digits [(p (* Parser)) (radix i32)] i32
+	(let ret 0)
+	(let cont ⊤)
+	(while cont {
+		(let pair (parser_parse_digit p radix))
+		(if (. pair 0) (set cont ⊥) {
+			(set ret (+ (× ret radix) (. pair 1)))
+		})
+	})
+	(return ret)
+)
+
+(gen-llist val_llist Val)
+(gen-map-unique parse_table i32 (→ [(* Parser)] Val))
+
+(fn init_parse_table [] void
+	(set parse_table (trie_new))
+	(macro parse_table_rule [ch (… body)]
+		`(parse_table_insert_mut ʹch (fn [(p (* Parser))] Val (parser_next p) ʺbody))
+	)
+	(macro parse_table_delim [ch1 ch2 (… prefix)]
+		`(parse_table_rule ʹch1
+			(let ll (parser_run p ʹch2))
+			(parser_next p)
+			(let len (+ (val_llist_len ll) ʹ(len prefix)))
+			(let ret (list_alloc len))
+			(let start (list_to_carray ret))
+			(let end (& (. start (- len 1))))
+			ʺ(mapi (fn [x i] `(set (. start ʹi) ʹ(. prefix i))) prefix)
+			(val_llist_flatten ll end)
+			(return (cast ret Val))
+		)
+	)
+	(macro parse_table_prefix [ch prefix]
+		`(parse_table_rule ʹch
+			(let ret (list_alloc 2))
+			(list_set ret 0 ʹprefix)
+			(list_set ret 1 (parser_parse_unit p))
+			(return (cast ret Val))
+		)
+	)
+	(parse_table_rule "◎ (return '◎))
+	(parse_table_rule "⊤ (return '⊤))
+	(parse_table_rule "⊥ (return '⊥))
+	(parse_table_delim "( "))
+	(parse_table_delim "[ "] 'list)
+	(parse_table_delim "{ "} 'brace)
+	(parse_table_delim "⟨ "⟩ 'angle)
+	(parse_table_prefix "' 'quote)
+	(parse_table_prefix "` 'quasiquote)
+	(parse_table_prefix "ʹ 'unquote)
+	(parse_table_prefix "ʺ 'unquote-splicing)
+	(parse_table_rule ""
+		(let pair (parser_parse_char p ⊥ (undef i32)))
+		(return (Char (. pair 1)))
+	)
+	(parse_table_rule "“
+		(return (cast (parser_parse_string p "”) Val))
+	)
+	(parse_table_rule "‘
+		(return (sym_of_str (parser_parse_string p "’)))
+	)
+)
+
+(fn parser_parse_unit [(p (* Parser))] Val
+	(let ch (parser_look p))
+	(cond
+		((charset_has cs_I1 ch)
+			(let pair (parser_collect p cs_I2))
+			(return (Sym (. pair 0) (. pair 1)))
+		)
+		((charset_has cs_N ch)
+			(macro parse_base [radix] `(return (Int (parser_parse_digits p ʹradix))))
+			(macro parse_base_next [radix] (, `(parser_next p) `(parse_base ʹradix)))
+			(if (= ch "0) {
+				(parser_next p)
+				(set ch (parser_look p))
+				(cond
+					((= ch "x) (parse_base_next 16))
+					((= ch "o) (parse_base_next 8))
+					((= ch "b) (parse_base_next 2))
+					(⊤ (parse_base 10))
+				)
+			} (parse_base 10))
+		)
+		((parse_table_has ch) (return ((parse_table_get ch) p)))
+	)
+	(error “Syntax Error: invalid unit start”)
+	(return (undef Val))
+)
+
+(fn parser_run [(p (* Parser)) (end_char i32)] (* val_llist)
+	(parser_skip_whitespace p)
+	(let l (val_llist_nil))
+	(while (≠ (parser_look p) end_char) {
+		(set l (val_llist_cons (parser_parse_unit p) l))
+		(parser_skip_whitespace p)
+	})
+	(return l)
+)
+
+(fn parser_parse [(p (* Parser))] (* List)
+	(let ll (parser_run p "\0))
+	(let len (val_llist_len ll))
+	(let ret (list_alloc len))
+	(val_llist_flatten ll (& (. (list_to_carray ret) (- len 1))))
+	(return ret)
+)
+
+; ======== ;
+; Matching ;
+; ======== ;
+
+(struct LiteralMatch
+	(tag i32)
+	(val Val)
+)
+
+(struct EvalMatch
+	(tag i32)
+	(val Val)
+)
+
+(struct BindMatch
+	(tag i32)
+	(sym i32)
+)
+
+(struct CaptureMatch
+	(tag i32)
+	(sym i32)
+	(match (* Match))
+)
+
+(struct ListMatch
+	(tag i32)
+	(len i32)
+	(rest i32)
+)
+
+(struct GenMatch
+	(tag i32)
+	(len i32)
+	(rest i32)
+	(type (* Match))
+)
+
+(enum
+	ANY_MATCH
+	LITERAL_MATCH
+	EVAL_MATCH
+	BIND_MATCH
+	CAPTURE_MATCH
+	GENERIC_MATCH
+)
+
+(fn match_new_literal [(x Val)] (* Match)
+	(let ret (as (malloc (sizeof LiteralMatch)) (* LiteralMatch)))
+	(set (-> ret tag) LITERAL_MATCH)
+	(set (-> ret val) x)
+	(return (as ret (* Match)))
+)
+
+(fn match_new_eval [(x Val)] (* Match)
+	(let ret (as (malloc (sizeof EvalMatch)) (* EvalMatch)))
+	(set (-> ret tag) EVAL_MATCH)
+	(set (-> ret val) x)
+	(return (as ret (* Match)))
+)
+
+(fn match_new_bind [(sym i32)] (* Match)
+	(let ret (as (malloc (sizeof BindMatch)) (* BindMatch)))
+	(set (-> ret tag) BIND_MATCH)
+	(set (-> ret sym) sym)
+	(return (as ret (* Match)))
+)
+
+(fn match_new_capture [(sym i32) (m (* Match))] (* Match)
+	(let ret (as (malloc (sizeof CaptureMatch)) (* CaptureMatch)))
+	(set (-> ret tag) CAPTURE_MATCH)
+	(set (-> ret sym) sym)
+	(set (-> ret match) m)
+	(return (as ret (* Match)))
+)
+
+(fn match_alloc_gen [(len i32) (rest i32) (type (* Match))] (* GenMatch)
+	(let ret (as (malloc (+ (sizeof GenMatch) (× len (sizeof (* Match))))) (* GenMatch)))
+	(set (-> ret tag) GENERIC_MATCH)
+	(set (-> ret len) len)
+	(set (-> ret rest) rest)
+	(set (-> ret type) type)
+	(return ret)
+)
+
+(macro TODO_hash [x] `(. 'ʹx val))
+(fn match_comp [(x Val)] (* Match)
+	(if (is_prim x) {
+		(if (= (. x tag) SYM)
+			(return (match_new_bind (. x val)))
+			(return (match_new_literal x))
+		)
+	} {
+		(let l (cast x (* List)))
+		(when (∨ (∨ (≠ (-> l tag) LIST) (= (-> l len) 0)) (≠ (get_tag (list_get l 0)) SYM))
+			(error “match_comp: could not parse list”)
+		)
+		; (macro show_sym [sym] `{ (print 'ʹsym) (putstr “ ”) (println (Int (. 'ʹsym val))) })
+		(macro comp-generic [offset type] `{
+			(let rest (- 0 1))
+			(let n (- (-> l len) ʹoffset))
+			(when (> n 0)
+				(let last (list_get l (- (-> l len) 1)))
+				(when (= (get_tag last) LIST)
+					(let ll (cast last (* List)))
+					(when (∧ (> (-> ll len) 0) (equal (list_get ll 0) '…)) ; TODO_hash
+						(assert (= (-> ll len) 2))
+						(assert (= (get_tag (list_get ll 1)) SYM))
+						(set rest (. (list_get ll 1) val))
+						(set n (- n 1))
+					)
+				)
+			)
+			(let ret (match_alloc_gen n rest ʹtype))
+			(let elems (as (& (. ret 1)) (* (* Match))))
+			(let i 0)
+			(while (< i n) {
+				(set (. elems i) (match_comp (list_get l (+ i ʹoffset))))
+				(set i (+ i 1))
+			})
+			(return (as ret (* Match)))
+		})
+		(let h (. (list_get l 0) val))
+		(cond
+			((= h (TODO_hash quote))
+				(assert (= (-> l len) 2))
+				(return (match_new_literal (list_get l 1)))
+			)
+			((= h (TODO_hash !))
+				(assert (= (-> l len) 2))
+				(return (match_new_eval (list_get l 1)))
+			)
+			((= h (TODO_hash @))
+				(assert (= (-> l len) 3))
+				(return (match_new_capture (. (list_get l 1) val) (match_comp (list_get l 2))))
+			)
+			((= h (TODO_hash list))
+				(comp-generic 1 (match_new_literal (builtin_type_table_get LIST)))
+			)
+			((= h (TODO_hash #))
+				(assert (≥ (-> l len) 2))
+				(comp-generic 2 (match_new_eval (list_get l 1)))
+			)
+			(⊤ (error “match_comp: unsupported symbol ” (str_to_cstr (str_of_val (list_get l 0)))))
+		)
+	})
+	(error “unreachable match_comp”)
+	(return (undef (* Match)))
+)
+
+(gen-map scope i32 Val)
+
+(fn match_apply [(m (* Match)) (scopes (* scopes)) (x Val)] {bool (* Trie)}
+	(let ret (trie_new))
+	(fn inner [(m (* Match)) (scopes (* scopes)) (x Val) (scope (* Trie))] bool
+		(macro bind [sym val] `{
+			(let sym ʹsym)
+			(when (≠ sym (TODO_hash .))
+				(scope_insert_mut scope sym ʹval)
+			)
+		})
+		(switch (-> m tag)
+			(LITERAL_MATCH
+				(let y (-> (as m (* LiteralMatch)) val))
+				(return (equal x y))
+			)
+			(EVAL_MATCH
+				(let y (-> (as m (* EvalMatch)) val))
+				(return (equal x (eval scopes y)))
+			)
+			(BIND_MATCH
+				(let sym (-> (as m (* BindMatch)) sym))
+				(bind sym x)
+				(return ⊤)
+			)
+			(CAPTURE_MATCH
+				(let cm (as m (* CaptureMatch)))
+				(if (inner (-> cm match) scopes x scope) {
+					(bind (-> cm sym) x)
+					(return ⊤)
+				} (return ⊥))
+			)
+			(GENERIC_MATCH
+				(let om (as m (* GenMatch)))
+				(let rest (-> om rest))
+				(let matches (as (& (. om 1)) (* (* Match))))
+				(let len (undef i32))
+				(let carray (undef (* Val)))
+				(let tag (get_tag x))
+				(when (¬ (inner (-> om type) scopes (typeof x) scope)) (return ⊥))
+				(switch tag
+					(NULL
+						(return (= (-> om len) 0))
+					)
+					(OBJ
+						(let o (cast x (* Obj)))
+						(set len (-> o len))
+						(set carray (obj_to_carray o))
+					)
+					(LIST
+						(let l (cast x (* List)))
+						(set len (-> l len))
+						(set carray (list_to_carray l))
+					)
+					{
+						(when (≠ (-> om len) 1) (return ⊥))
+						(return (inner (. matches 0) scopes x scope))
+					}
+				)
+				(let -1 (- 0 1))
+				(if (≠ rest -1)
+					(when (> (-> om len) len) (return ⊥))
+					(when (≠ (-> om len) len) (return ⊥))
+				)
+				(let i 0)
+				(while (< i (-> om len)) {
+					(when (∨ (≥ i len) (¬ (inner (. matches i) scopes (. carray i) scope)))
+						(return ⊥)
+					)
+					(set i (+ i 1))
+				})
+				(when (≠ rest -1)
+					(let m (- len (-> om len)))
+					(bind rest (cast (list_of_carray m (& (. carray i))) Val))
+				)
+				(return ⊤)
+			)
+			(error “match_apply: unimplemented”)
+		)
+		(error “unreachable match_apply inner”)
+		(return ⊥)
+	)
+	(return (, (inner m scopes x ret) ret))
+)
+
+(fn match_apply_req [(m (* Match)) (scopes (* scopes)) (x Val)] (* Trie)
+	(let pair (match_apply m scopes x))
+	(when (¬ (. pair 0))
+		(error “match failed”)
+	)
+	(return (. pair 1))
+)
+
+; ==== ;
+; Eval ;
+; ==== ;
+
+(macro scopes_looper [name ['list (… args)] ret (… body)]
+	; TODO: remove this when auto-undef returns are implemented
+	(let end (if (= ret 'void) `(return) `(return (undef ʹret))))
+	`(fn ʹname [(scopes (* scopes)) (hash i32) ʺargs] ʹret
+		(let s scopes)
+		(while (¬ (-> s end)) {
+			(let scope (-> s val))
+			(when (scope_has scope hash)
+				ʺbody
+			)
+			(set s (-> s next))
+		})
+		(error “not in scope ” (str_to_cstr (sym_table_str hash)))
+		ʹend
+	)
+)
+(scopes_looper lookup_scopes [] Val
+	(return (scope_get scope hash))
+)
+(scopes_looper set_scopes [(x Val)] void
+	(scope_insert_mut scope hash x)
+	(return)
+)
+(fn bind_scopes [(scopes (* scopes)) (hash i32) (x Val)] void
+	(scope_insert_mut (-> scopes val) hash x)
+)
+
+(gen-map-unique eval_table i32 (→ [(* scopes) i32 (* Val)] Val))
+(fn init_eval_table [] void
+	(set eval_table (trie_new))
+	(macro form [name (… body)]
+		`(eval_table_insert_mut (TODO_hash ʹname) (fn [(scopes (* scopes)) (len i32) (args (* Val))] Val
+			ʺbody
+		))
+	)
+	(form fn
+		(assert (≥ len 1))
+		(return (cast (func_new scopes (match_comp (. args 0)) (- len 1) (& (. args 1))) Val))
+	)
+	(form macro
+		(assert (≥ len 1))
+		(return (cast (macro_new scopes (match_comp (. args 0)) (- len 1) (& (. args 1))) Val))
+	)
+	(form quote
+		(assert (= len 1))
+		(return (. args 0))
+	)
+	(form quasiquote
+		(assert (= len 1))
+		(fn inner [(scopes (* scopes)) (x Val) (ret (* (* List)))] void
+			(macro push [x] `(set (* ret) (list_append_val (* ret) ʹx)))
+			(macro passthrough [] '{ (push x) (return) })
+			(if (= (get_tag x) LIST) {
+				(let l (cast x (* List)))
+				(when (= (-> l len) 0)
+					(passthrough)
+				)
+				(cond
+					; TODO: switch on compile-type hash values
+					((equal (list_get l 0) 'unquote)
+						(assert (= (-> l len) 2))
+						(push (eval scopes (list_get l 1)))
+						(return)
+					)
+					((equal (list_get l 0) 'unquote-splicing)
+						(assert (= (-> l len) 2))
+						(let y (eval scopes (list_get l 1)))
+						(assert (= (get_tag y) LIST))
+						(let l (cast y (* List)))
+						(let i 0)
+						(while (< i (-> l len)) {
+							(push (list_get l i))
+							(set i (+ i 1))
+						})
+						(return)
+					)
+					(⊤
+						(let retʹ (list_empty))
+						(let i 0)
+						(while (< i (-> l len)) {
+							(inner scopes (list_get l i) (& retʹ))
+							(set i (+ i 1))
+						})
+						(push (cast retʹ Val))
+						(return)
+					)
+				)
+			} (passthrough))
+		)
+		(let ret (list_empty))
+		(inner scopes (. args 0) (& ret))
+		(return (tup_unpack ret))
+	)
+	(macro assignment [name fn] `(form ʹname {
+		(assert (= len 2))
+		(let m (match_comp (. args 0)))
+		(let v (eval scopes (. args 1)))
+		(let matches (match_apply_req m scopes v))
+		(trie_iter matches (fn [(_ i32) (prefix (* i8)) (value (* i8)) (data (* i8))] void
+			(ʹfn (as data (* scopes)) (*as prefix i32) (cast value Val))
+		) (as scopes (* i8)))
+		(return '◎)
+	}))
+	(assignment let bind_scopes)
+	(assignment set set_scopes)
+	(form if
+		(assert (= len 3))
+		(let cond (eval scopes (. args 0)))
+		(assert (= (get_tag cond) BOOL))
+		(if (. cond val)
+			(return (eval scopes (. args 1)))
+			(return (eval scopes (. args 2)))
+		)
+		(return (undef Val))
+	)
+	(macro eval-block [scope '& ret '← len args] `{
+		(let scopes (scopes_cons ʹscope scopes))
+		(let _i 0)
+		(let _n ʹlen)
+		(while (< _i _n) {
+			ʹ{ (let r `(eval scopes (. ʹargs _i))) (if (= ret ◎) r `(set ʹret ʹr)) }
+			(set _i (+ _i 1))
+		})
+	})
+	(form while
+		(assert (≤ 1 len))
+		(let body (& (. args 1)))
+		(let break ⊥)
+		(while (¬ break) {
+			(let cond (eval scopes (. args 0)))
+			(assert (= (get_tag cond) BOOL))
+			(if (. cond val) (eval-block (trie_new) & ◎ ← (- len 1) body) (set break ⊤))
+		})
+		(return '◎)
+	)
+	(form brace
+		(let ret '◎)
+		(eval-block (trie_new) & ret ← len args)
+		(return ret)
+	)
+	(form match
+		(assert (≤ 1 len))
+		(let v (eval scopes (. args 0)))
+		(let i 1)
+		(while (< i len) {
+			(assert (= (get_tag (. args i)) LIST))
+			(let l (cast (. args i) (* List)))
+			(assert (≤ 1 (-> l len)))
+			(let m (match_comp (list_get l 0)))
+			(let pair (match_apply m scopes v))
+			(let ret '◎)
+			(when (. pair 0)
+				(eval-block (. pair 1) & ret ← (- (-> l len) 1) (& (. (list_to_carray l) 1)))
+				(return ret)
+			)
+			(set i (+ i 1))
+		})
+		(error “no matches found”)
+		(return (undef Val))
+	)
+	(form type
+		(assert (= len 1))
+		(assert (= (get_tag (. args 0)) SYM))
+		(return (cast (type_new (. args 0)) Val))
+	)
+	(form eval
+		(let i 0)
+		(let ret '◎)
+		(while (< i len) {
+			(let arg (eval scopes (. args i)))
+			(set ret (eval scopes arg))
+			(set i (+ i 1))
+		})
+		(return ret)
+	)
+)
+
+(fn func_call [(f (* Func)) (len i32) (args (* Val))] Val
+	(let args_array (cast (list_of_carray len args) Val))
+	(let scopes (-> f scopes))
+	(let scope (match_apply_req (-> f args) scopes args_array))
+	(let scopes (scopes_cons scope scopes))
+	(let body (func_body f))
+	(let ret '◎)
+	(let i 0)
+	(let n (-> f len))
+	(while (< i n) {
+		(set ret (eval scopes (. body i)))
+		(set i (+ i 1))
+	})
+	(return ret)
+)
+
+(fn is_macro [(x Val)] bool
+	(return (∧ (= (get_tag x) FUNC) (-> (cast x (* Func)) macro)))
+)
+
+(fn call [(f Val) (len i32) (args (* Val))] Val
+	(switch (get_tag f)
+		(FUNC
+			(let f (cast f (* Func)))
+			(if (-> f builtin) {
+				(let b (as f (* BuiltinFunc)))
+				(return ((-> b f) len args))
+			} {
+				(return (func_call f len args))
+			})
+		)
+		(TYPE
+			(let t (cast f (* Type)))
+			(when (-> t builtin)
+				(let tag (-> (as t (* BuiltinType)) id))
+				(if (∧ (= tag NULL) (= len 0)) {
+					(return '◎)
+				} {
+					(assert (= len 1))
+					(let x (* args))
+					(assert (= (get_tag x) tag))
+					(return x)
+				})
+			)
+			(let ret (obj_alloc t len))
+			(memcpy (as (obj_to_carray ret) (* i8)) (as args (* i8)) (× len (sizeof Val)))
+			(return (cast ret Val))
+		)
+		()
+	)
+	(error “value is not a function”)
+	(return (undef Val))
+)
+
+(fn eval [(scopes (* scopes)) (x Val)] Val
+	(when (is_prim x)
+		(if (= (. x tag) SYM)
+			{
+				(let sym (. x val))
+				(return (lookup_scopes scopes (. x val)))
+			}
+			(return x)
+		)
+	)
+	(switch (get_tag x)
+		(STR (return x))
+		(LIST ())
+		(TUP
+			(let l (cast x (* List)))
+			(let i 0)
+			(while (< i (-> l len)) {
+				(eval scopes (list_get l i))
+				(set i (+ i 1))
+			})
+			(return '◎)
+		)
+		(error “can not eval value”)
+	)
+	(let l (cast x (* List)))
+	(when (= (-> l len) 0)
+		(return '◎)
+	)
+	(let args (list_to_carray l))
+	(let first (* args))
+	(set args (& (. args 1)))
+	(let args_len (- (-> l len) 1))
+	(when (∧ (= (get_tag first) SYM) (eval_table_has (. first val)))
+		(return ((eval_table_get (. first val)) scopes args_len args))
+	)
+	(let f (eval scopes first))
+	(let is_macro (is_macro f))
+	(when (¬ is_macro)
+		(let args_eval (alloca Val args_len))
+		(let i 0)
+		(while (< i args_len) {
+			(set (. args_eval i) (eval scopes (. args i)))
+			(set i (+ i 1))
+		})
+		(set args args_eval)
+	)
+	(let ret (call f args_len args))
+	(when is_macro
+		(set ret (eval scopes ret))
+	)
+	(return ret)
+)
+
+(gen-map-unique builtin_type_table i32 Val)
+(fn init_builtin_type_table [] void
+	(set builtin_type_table (trie_new))
+	(macro types args `{ ʺ(map (fn [[tag name]]
+		`(builtin_type_table_insert_mut ʹtag (builtin_type_new 'ʹname ʹtag))
+	) args) })
+	(types
+		(NULL Null)
+		(BOOL Bool)
+		(INT Int)
+		(CHAR Char)
+		(SYM Sym)
+		(SET Set)
+		(MAP Map)
+		(LIST List)
+		(TUP Tup)
+		(STR Str)
+		(FUNC Func)
+		(TYPE Type)
+	)
+)
+
+(fn typeof [(x Val)] Val
+	(let tag (get_tag x))
+	(when (= tag OBJ)
+		(let o (cast x (* Obj)))
+		(return (cast (-> o type) Val))
+	)
+	(return (builtin_type_table_get tag))
+)
+
+(static builtins (* Trie))
+(fn init_builtins [] void
+	(set builtins (trie_new))
+	(macro builtin [sym ['list (… args)] (… body)]
+		(let length_requirement `(assert (= len ʹ(len args))))
+		(let rest ◎)
+		(when (> (len args) 0)
+			(let last (. args (- (len args) 1)))
+			(when (∧ (= (typeof last) List) (= (. last 0) '…))
+				(set args (sub args 0 (- (len args) 1)))
+				(set length_requirement `(assert (≥ len ʹ(len args))))
+				(set rest (. last 1))
+			)
+		)
+		`(scope_insert_mut builtins (TODO_hash ʹsym) (cast (builtin_func_new (fn [(len i32) (args (* Val))] Val
+			ʹlength_requirement
+			ʺ(mapi (fn [[. t] i] (match t
+				('bool `(assert (= (get_tag (. args ʹi)) BOOL)))
+				('int `(assert (= (get_tag (. args ʹi)) INT)))
+				('sym `(assert (= (get_tag (. args ʹi)) SYM)))
+				('str `(assert (= (get_tag (. args ʹi)) STR)))
+				('list `(assert (= (get_tag (. args ʹi)) LIST)))
+				('set `(assert (= (get_tag (. args ʹi)) SET)))
+				('map `(assert (= (get_tag (. args ʹi)) MAP)))
+				('type `(assert (= (get_tag (. args ʹi)) TYPE)))
+				('* `())
+			)) args)
+			ʺ(mapi (fn [[name t] i] (match t
+				('bool `(let ʹname (as (. args ʹi val) bool)))
+				('int `(let ʹname (. args ʹi val)))
+				('sym `(let ʹname (. args ʹi)))
+				('str `(let ʹname (cast (. args ʹi) (* Str))))
+				('list `(let ʹname (cast (. args ʹi) (* List))))
+				('set `(let ʹname (cast (. args ʹi) (* Set))))
+				('map `(let ʹname (cast (. args ʹi) (* Map))))
+				('type `(let ʹname (cast (. args ʹi) (* Type))))
+				('* `(let ʹname (. args ʹi)))
+			)) args)
+			ʺ(if (= rest ◎) [] [`(let len (- len ʹ(len args))) `(let ʹrest (& (. args ʹ(len args))))])
+			ʺbody
+		)) Val))
+	)
+	(trie_iter builtin_type_table (fn [(_ i32) (_ (* i8)) (value (* i8)) (data (* i8))] void
+		(let builtins (* (as data (* (* Trie)))))
+		(let type (as value (* BuiltinType)))
+		(scope_insert_mut builtins (-> type name val) type)
+	) (&as builtins i8))
+	(macro binops [t1 t2 (… args)] `{ ʺ(map (fn [sym] `(builtin ʹsym [(x ʹt1) (y ʹt1)]
+		(return (ʹt2 (ʹsym x y)))
+	)) args) })
+	(builtin + [(x int) (y int)]
+		(return (Int (+ x y)))
+	)
+	(binops int Int + - × / %)
+	(binops int Bool < > ≤ ≥)
+	(builtin = [(x *) (y *)]
+		(return (Bool (equal x y)))
+	)
+	(builtin ≠ [(x *) (y *)]
+		(return (Bool (¬ (equal x y))))
+	)
+	(binops bool Bool ∧ ∨)
+	(builtin ¬ [(x bool)]
+		(return (Bool (¬ x)))
+	)
+	(builtin print [(x *)]
+		(println x)
+		(return '◎)
+	)
+	(builtin debug [(x *)]
+		(eprintln x)
+		(return '◎)
+	)
+	(builtin show [(x *)]
+		(return (cast (show x) Val))
+	)
+	(macro accum [name (… body)] `(builtin ʹname [(… args)]
+		(let i 0)
+		(let accum 0)
+		(let first ⊤)
+		(while (< i len) {
+			(assert (= (get_tag (. args i)) INT))
+			(let x (. args i val))
+			ʺbody
+			(set i (+ i 1))
+			(set first ⊥)
+		})
+		(return (Int accum))
+	))
+	(accum sum (set accum (+ accum x)))
+	(accum max (when (∨ first (> x accum)) (set accum x)))
+	(accum min (when (∨ first (< x accum)) (set accum x)))
+	(builtin str [(x *)]
+		(return (cast (str_of_val x) Val))
+	)
+	(builtin sym [(x *)]
+		(return (sym_of_str (str_of_val x)))
+	)
+	(builtin func [(x *) (l list)]
+		(let scopes (scopes_cons builtins (scopes_nil)))
+		(return (cast (func_new scopes (match_comp x) (-> l len) (list_to_carray l)) Val))
+	)
+	(builtin int [(x *)]
+		(return (int_of_val x))
+	)
+	(builtin bytes [(s str)]
+		(let len (-> s len))
+		(let cstr (str_to_cstr s))
+		(let ret (list_alloc len))
+		(let carray (list_to_carray ret))
+		(let i 0)
+		(while (< i len) {
+			(set (. carray i) (Int (. cstr i)))
+			(set i (+ i 1))
+		})
+		(return (cast ret Val))
+	)
+	(builtin each [(f *) (l list)]
+		(let carray (list_to_carray l))
+		(let n (-> l len))
+		(let i 0)
+		(while (< i n) {
+			(call f 1 (& (. carray i)))
+			(set i (+ i 1))
+		})
+		(return '◎)
+	)
+	(builtin filter [(f *) (l list)]
+		(let carray (list_to_carray l))
+		(let ret (list_empty))
+		(let n (-> l len))
+		(let i 0)
+		(while (< i n) {
+			(let b (call f 1 (& (. carray i))))
+			(assert (= (get_tag b) BOOL))
+			(when (. b val)
+				(set ret (list_append_val ret (. carray i)))
+			)
+			(set i (+ i 1))
+		})
+		(return (cast ret Val))
+	)
+	(builtin map [(f *) (l list)]
+		(let carray (list_to_carray l))
+		(let n (-> l len))
+		(let ret (list_alloc n))
+		(let i 0)
+		(while (< i n) {
+			(list_set ret i (call f 1 (& (. carray i))))
+			(set i (+ i 1))
+		})
+		(return (cast ret Val))
+	)
+	(builtin mapi [(f *) (l list)]
+		(let carray (list_to_carray l))
+		(let n (-> l len))
+		(let ret (list_alloc n))
+		(let i 0)
+		(while (< i n) {
+			(let a [Val (. carray i) (Int i)])
+			(list_set ret i (call f 2 (&* a)))
+			(set i (+ i 1))
+		})
+		(return (cast ret Val))
+	)
+	(builtin len [(x *)]
+		(switch (get_tag x)
+			(LIST (return (Int (-> (cast x (* List)) len))))
+			(STR (return (Int (-> (cast x (* Str)) len))))
+			(error “value does not have a len”)
+		)
+		(return (undef Val))
+	)
+	(builtin concat [(… args)]
+		(when (= len 0)
+			(return (cast (list_empty) Val))
+		)
+		(let first (. args 0))
+		(macro concat-str [sym '→ expr] `{
+			(let ʹsym (str_empty))
+			(let i 0)
+			(while (< i len) {
+				(set ʹsym (str_append ʹsym (str_of_val (. args i))))
+				(set i (+ i 1))
+			})
+			(return ʹexpr)
+		})
+		(switch (get_tag first)
+			(SYM (concat-str ret → (sym_of_str ret)))
+			(STR (concat-str ret → (cast ret Val)))
+			(LIST
+				(let ret (list_empty))
+				(let i 0)
+				(while (< i len) {
+					(assert (= (get_tag (. args i)) LIST))
+					(set ret (list_append ret (cast (. args i) (* List))))
+					(set i (+ i 1))
+				})
+				(return (cast ret Val))
+			)
+			(MAP
+				(assert (= len 2))
+				(assert (= (get_tag (. args 1)) MAP))
+				(return (cast (map_union (cast (. args 0) (* Map)) (cast (. args 1) (* Map))) Val))
+			)
+			()
+		)
+		(error “concat: Type Error”)
+		(return (undef Val))
+	)
+	(macro str-join [s len l '→ ret] (,
+		`(let ʹret (str_empty))
+		`{
+			(let i 0)
+			(let n ʹlen)
+			(let carray ʹl)
+			(while (< i n) {
+				(when (≠ i 0) {
+					(set ʹret (str_append ʹret ʹs))
+				})
+				(let elem (. carray i))
+				(assert (= (get_tag elem) STR))
+				(set ʹret (str_append ʹret (cast elem (* Str))))
+				(set i (+ i 1))
+			})
+		}
+	))
+	(builtin join [(s str) (l list)]
+		(str-join s (-> l len) (list_to_carray l) → ret)
+		(return (cast ret Val))
+	)
+	(builtin sub [(l list) (start int) (end int)]
+		(assert (≤ start end))
+		(assert (≤ 0 start))
+		(assert (≤ end (-> l len)))
+		(return (cast (list_of_carray (- end start) (& (. (list_to_carray l) start))) Val))
+	)
+	(builtin puts [(s str)]
+		(putstr (str_to_cstr s))
+		(return '◎)
+	)
+	(builtin apply [(f *) (l list)]
+		(return (call f (-> l len) (list_to_carray l)))
+	)
+	(builtin typeof [(x *)]
+		(return (typeof x))
+	)
+	(builtin alloc [(t type) (n int) (… args)]
+		(assert (≤ len n))
+		(macro populate [carray] `{
+			(let carray ʹcarray)
+			(memcpy (as carray (* i8)) (as args (* i8)) (× len (sizeof Val)))
+			(let i len)
+			(while (< i n) {
+				(set (. carray i) '◎)
+				(set i (+ i 1))
+			})
+		})
+		(if (-> t builtin) {
+			(when (≠ (-> (as t (* BuiltinType)) id) LIST)
+				(error “can not allocate non-list builtin type”)
+			)
+			(let ret (list_alloc n))
+			(populate (list_to_carray ret))
+			(return (cast ret Val))
+		} {
+			(let ret (obj_alloc t n))
+			(populate (obj_to_carray ret))
+			(return (cast ret Val))
+		})
+		(return (undef Val))
+	)
+	(builtin list [(… args)]
+		(return (cast (list_of_carray len args) Val))
+	)
+	(builtin , [(… args)]
+		(return (tup_of_carray len args))
+	)
+	(builtin pack [(x *)]
+		(return (cast (tup_pack x) Val))
+	)
+	(builtin unpack [(l list)]
+		(return (tup_unpack l))
+	)
+	(builtin Map [(… args)]
+		(let ret (map_new))
+		(let i 0)
+		(while (< i len) {
+			(assert (= (get_tag (. args i)) LIST))
+			(let l (cast (. args i) (* List)))
+			(assert (= (-> l len) 2))
+			(map_insert_mut ret (list_get l 0) (list_get l 1))
+			(set i (+ i 1))
+		})
+		(return (cast ret Val))
+	)
+	(builtin insert [(m map) (key *) (value *)]
+		(return (cast (map_insert m key value) Val))
+	)
+	(builtin union [(… args)]
+		(let ret (map_new))
+		(let i 0)
+		(while (< i len) {
+			(assert (= (get_tag (. args i)) MAP))
+			(set ret (map_union ret (cast (. args i) (* Map))))
+			(set i (+ i 1))
+		})
+		(return (cast ret Val))
+	)
+	(macro map-trans [name expr] `(builtin ʹname [(m map)]
+		(let ret (list_empty))
+		(map_iter m (fn [(key Val) (value Val) (data (* i8))] void
+			(let l (as data (* (* List))))
+			(set (* l) (list_append_val (* l) ʹexpr))
+		) (&as ret i8))
+		(return (cast ret Val))
+	))
+	(map-trans values value)
+	(map-trans keys key)
+	(map-trans items (cast (list_of_carray 2 (&* [Val key value])) Val))
+	(builtin error [(… args)]
+		(let space (str_of_cstr 1 “ ”))
+		(str-join space len args → s)
+		(eputstr “error: ”)
+		(eputstrln (str_to_cstr s))
+		(exit 1)
+		(return (undef Val))
+	)
+	(macro accessor [name ['list (… args)] [list_expr obj_expr map_expr]] `(builtin ʹname [(col *) (x *) ʺargs]
+		(switch (get_tag col)
+			(LIST
+				(assert (= (get_tag x) INT))
+				(let l (cast col (* List)))
+				(let i (. x val))
+				ʹlist_expr
+			)
+			(OBJ
+				(assert (= (get_tag x) INT))
+				(let o (cast col (* Obj)))
+				(let i (. x val))
+				ʹobj_expr
+			)
+			(MAP
+				(let m (cast col (* Map)))
+				ʹmap_expr
+			)
+			()
+		)
+		(error ʹ(concat (str name) “: Type Error”))
+		(return (undef Val))
+	))
+	(accessor has [] (
+		(return (Bool (∧ (≤ 0 i) (< i (-> l len)))))
+		(return (Bool (∧ (≤ 0 i) (< i (-> o len)))))
+		(return (Bool (map_has m x)))
+	))
+	(accessor . [] (
+		{ (assert (∧ (≤ 0 i) (< i (-> l len)))) (return (list_get l i)) }
+		{ (assert (∧ (≤ 0 i) (< i (-> o len)))) (return (obj_get o i)) }
+		{ (assert (map_has m x)) (return (map_get m x)) }
+	))
+	(accessor ← [(y *)] (
+		{ (assert (∧ (≤ 0 i) (< i (-> l len)))) (list_set l i y) (return '◎) }
+		{ (assert (∧ (≤ 0 i) (< i (-> o len)))) (obj_set o i y) (return '◎) }
+		{ (assert (map_has m x)) (map_insert_mut m x y) (return '◎) }
+	))
+	(builtin read_file [(fname str)]
+		(let n (undef i64))
+		(let s (as 0 (* i8)))
+		(read_file (str_to_cstr fname) (& n) (& s))
+		(let ret (str_alloc n))
+		(let cstr (str_to_cstr ret))
+		(memcpy cstr s n)
+		(set (. cstr n) "\0)
+		(return (cast ret Val))
+	)
+	(builtin parse [(s str)]
+		(return (cast (parser_parse (& (parser_new (str_to_cstr s)))) Val))
+	)
+)
+
+; TODO: return value coersion and auto-undef return
+; TODO: implement noreturn type
+; TODO: use single quotes for strings (unescaped pairs?)
+; TODO: use non-constructable symbols for ʹ, ʺ, [, {, instead of "quote", "brack" ...
+; TODO: convert all unquote-splicing to unquote with tuple unpack (free up ʺ symbol)
+; TODO: memoise compilation of matches
+; TODO: experiment with likelihood of sym hash collisions
+
+(extern read_file [(* i8) (* i64) (* (* i8))] void)
+
+(fn main [(argc i32) (argv (* (* i8)))] i32
+	(init_sym_table)
+	(init_charsets)
+	(init_parse_table)
+	(init_eval_table)
+	(init_builtin_type_table)
+	(init_builtins)
+
+	(assert (≥ argc 2))
+	(let scopes (scopes_cons builtins (scopes_nil)))
+
+	(when (= 0 (strcmp (. argv 1) “-e”))
+		(assert (= argc 3))
+		(let l (parser_parse (& (parser_new (. argv 2)))))
+		(let i 0)
+		(while (< i (-> l len)) {
+			(eval scopes (list_get l i))
+			(set i (+ i 1))
+		})
+		(return 0)
+	)
+
+	(let len (undef i64))
+	(let s (as 0 (* i8)))
+	(read_file (. argv 1) (& len) (& s))
+
+	(let l (list_empty))
+	(let i 2)
+	(while (< i argc) {
+		(set l (list_append_val l (cast (str_of_cstr (strlen (. argv i)) (. argv i)) Val)))
+		(set i (+ i 1))
+	})
+	(scope_insert_mut builtins (TODO_hash ARGV) (cast l Val))
+
+	(let scopes (scopes_cons builtins (scopes_nil)))
+	(let exprs (parser_parse (& (parser_new s))))
+	(let i 0)
+	(let ret '◎)
+	(let ___stage2___ '___stage2___)
+	(while (< i (-> exprs len)) {
+		(let expr (list_get exprs i))
+		(when (equal expr ___stage2___)
+			(let exprs (list_of_carray (- (-> exprs len) (+ i 1)) (& (. (list_to_carray exprs) (+ i 1)))))
+			(let stage2 (scope_get builtins (. 'stage2 val)))
+			(call stage2 1 (& (cast exprs Val)))
+			(return 0)
+		)
+		(set ret (eval scopes expr))
+		(set i (+ i 1))
+	})
+
+	(return 0)
+)
